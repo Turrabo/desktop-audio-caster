@@ -11,9 +11,9 @@ single-clock pacing, network failure modes, HTTP contract.)
 - Reliability and simplicity above all. Latency: fixed ~2-4 s accepted (D&D ambience, no lip
   sync). The number is measured, not promised, and groups may sit at the high end.
 - The laptop must not make audible sound while casting.
-- Safety rails (testing phase): never set any speaker volume above 3%; NEVER change the
-  volume of the "Office" speaker under any circumstances — directly OR via a group (group
-  volume rescales member volumes). Casting to a group containing Office is OK.
+- The app ships with NO volume guards (config defaults permissive). Volume restraint applies
+  only to Claude-run testing: ≤3%, and no volume ops on "Office" (see project memory
+  `testing-volume-etiquette`). safety.py remains as a config-driven choke point.
 
 ## Architecture (decided with user)
 
@@ -38,7 +38,7 @@ pychromecast: resident CastBrowser discovery, connect, play_media(url), status, 
 | `streamer/pacer.py` | ONE monotonic sample clock. Pulls real frames when available; when capture is silent/stopped, synthesizes exactly the missing sample count (no independent timer, no second clock — this is the anti-drift core). |
 | `streamer/server.py` | aiohttp on a fixed configurable port. Endless WAV: RIFF/data sizes 0xFFFFFFFF, fresh header per connection, ignore/200 Range requests, no Content-Length. Header fields derived from the ACTUAL capture format. Per-client queue: frame-aligned drop-oldest (~1 s), drop events logged. |
 | `streamer/caster.py` | pychromecast wrapper. Resident CastBrowser (zeroconf) so speaker reboots / new IPs / group-leader migration are re-resolved live, not just at connect time. `play_media(url, "audio/wav")`. Watchdog: player state IDLE, sustained BUFFERING (>60 s), capture-health failure, or local IP change → tear down, re-derive stream URL from the current route-to-speaker source IP, re-cast with backoff (2 s → 30 s cap). |
-| `streamer/safety.py` | Single choke point for ALL volume ops, enforced not assumed: (1) every `Chromecast` handle is wrapped in a proxy that does not expose `set_volume`/`volume_up`/`volume_down`; (2) cap: refuse volume > `max_volume` (default 0.03); (3) Office rule: resolve group membership via MultizoneController and refuse ANY volume op targeting Office or any group whose members include Office; (4) automated test greps the codebase — `set_volume|volume_up|volume_down` may appear only in safety.py and its tests. |
+| `streamer/safety.py` | Single choke point for ALL volume ops, enforced not assumed: (1) every `Chromecast` handle is wrapped in a proxy that does not expose `set_volume`/`volume_up`/`volume_down`; (2) config-driven rules — `max_volume` cap, `office_names` protection incl. group-membership resolution via MultizoneController (fail closed), `allow_group_volume` — all permissive in shipped defaults; (3) automated test greps the codebase — `set_volume|volume_up|volume_down` may appear only in safety.py and its tests. |
 | `streamer/localmute.py` | Only if the muted-loopback probe passes: mute local endpoint on cast start (pycaw), unmute on stop via try/finally + atexit, PLUS unmute-on-next-start recovery (atexit doesn't run on hard kill). |
 | `streamer/tray.py` | pystray: pick device/group, start/stop, quit. Surfaces failures via tray notification ("cast died, retrying…"). Single-instance guard. |
 | `streamer/config.py` | `%APPDATA%/desktop-audio-streamer/config.json`: last device, max_volume, port, capture device override, stream_type. Logging to rotating file in same dir. |
@@ -68,9 +68,9 @@ pychromecast: resident CastBrowser discovery, connect, play_media(url), status, 
    Pass → localmute.py path. Fail → VB-Cable as the supported silent path (documented install,
    endpoint volume pinned 100%, app captures the cable). Decision recorded in README; the probe
    result also decides whether localmute.py is built at all.
-8. **Groups are devices** via the group leader, but volume ops on groups follow the Office rule
-   above. During the testing phase the app performs NO volume writes except the explicit
-   safety-layer verification tests (≤3%, non-Office, single speaker).
+8. **Groups are devices** via the group leader. Group volume ops go through safety.py's
+   config-driven rules like any other volume op; normal app operation performs no volume
+   writes at all (the user drives volume via Google Home / the speakers themselves).
 
 ### Dependencies
 
@@ -101,14 +101,15 @@ CPython 3.14 → if any fail, pin venv to 3.12 before writing code.
    detect corrupted audio.
 9. README, `git init`, commits.
 
-## Testing constraints (standing, from user 2026-07-10)
+## Testing constraints (standing)
 
-- Any `set_volume`: ≤ 0.03, single non-Office speaker, only to verify the safety layer.
-- "Office": NEVER any volume operation, direct or via group membership. Casting to a group
-  containing it is allowed. User may disconnect Office; its presence/absence in discovery is a
-  useful datapoint either way.
-- All speakers at 1% (inaudible): tonight = status-API verification only; audible checks are the
-  step-8 daytime gate.
+Apply to Claude-run tests only — the app itself is unguarded:
+
+- Any `set_volume` in a Claude test: ≤ 0.03 via an explicit restrictive cfg, non-Office speaker.
+- "Office": no volume operation from Claude tests, direct or via group membership. Casting to a
+  group containing it is fine.
+- Audible checks (sound quality, real latency) are the user's daytime gate — status APIs cannot
+  hear.
 
 ## Out of scope (this build)
 

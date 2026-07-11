@@ -1,16 +1,19 @@
-"""Volume safety layer - the ONLY module allowed to touch speaker volume.
+"""Volume choke point - the ONLY module allowed to touch speaker volume.
 
-Rules (standing user requirements, 2026-07-10):
-  1. No volume may ever be set above ``max_volume`` (config, default 0.03).
-  2. Devices named in ``office_names`` must NEVER have their volume changed,
-     directly or indirectly.
-  3. Group volume ops indirectly rescale every member's volume, so they are
-     REFUSED unless ``allow_group_volume`` is true AND membership was resolved
-     AND no protected device is a member. Fail closed: unresolvable membership
-     means refusal.
+Rules are config-driven and permissive by default (no cap, no protected
+devices, group volume allowed):
+  1. Volume above ``max_volume`` is refused (1.0 = uncapped).
+  2. Devices named in ``office_names`` never have their volume changed,
+     directly or indirectly (empty by default).
+  3. If ``allow_group_volume`` is false, group volume ops are refused, since
+     they rescale every member's own volume. When enabled with a non-empty
+     protected list, membership must resolve and contain no protected device -
+     fail closed.
 
-An automated test (tests/test_no_rogue_volume.py) asserts that volume-setting
-calls appear nowhere outside this module.
+Restrictive configs are used by Claude-run tests (see the project memory:
+Claude keeps its own testing at <=3%). An automated test
+(tests/test_no_rogue_volume.py) asserts that volume-setting calls appear
+nowhere outside this module.
 """
 from __future__ import annotations
 

@@ -9,9 +9,9 @@ APP_NAME = "desktop-audio-streamer"
 
 DEFAULTS = {
     "last_device": None,          # friendly name of last cast target
-    "max_volume": 0.03,           # SAFETY: hard cap, see safety.py
-    "allow_group_volume": False,  # SAFETY: group volume rescales member volumes; off by default
-    "office_names": ["office"],   # SAFETY: devices whose volume must never be changed
+    "max_volume": 1.0,            # safety.py cap; 1.0 = uncapped (user lifted 2026-07-11)
+    "allow_group_volume": True,   # group volume rescales member volumes
+    "office_names": [],           # devices whose volume must never be changed (none)
     "port": 8765,
     "stream_type": "LIVE",        # LIVE | BUFFERED (trial decides)
     "capture_device": None,       # None = default output; else substring of device name

@@ -8,7 +8,6 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from streamer import safety
-from streamer.config import DEFAULTS
 
 
 def fake_cast(name="Kitchen", cast_type="audio", uuid="u-1"):
@@ -19,7 +18,10 @@ def fake_cast(name="Kitchen", cast_type="audio", uuid="u-1"):
     return cast
 
 
-CFG = dict(DEFAULTS)
+# Tests exercise the MECHANISM with restrictive rules; the shipped defaults
+# are permissive (config.DEFAULTS) since the user lifted the testing-phase
+# guards on 2026-07-11.
+CFG = {"max_volume": 0.03, "office_names": ["office"], "allow_group_volume": False}
 
 
 class TestVolumeCap(unittest.TestCase):

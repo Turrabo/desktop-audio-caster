@@ -27,14 +27,13 @@ machine survives mute — verified empirically; it does NOT survive volume-0, so
 keep local volume above zero and let the app mute). A marker file restores the
 endpoint if the app dies without cleanup.
 
-## Volume safety
+## Volume architecture
 
-All speaker-volume writes go through `streamer/safety.py`:
-
-- hard cap: `max_volume` (default **3%**),
-- the `Office` speaker is never volume-adjusted, directly or via a group,
-- group volume writes are off entirely by default (`allow_group_volume`),
-- `tests/test_no_rogue_volume.py` fails if any other module gains a volume call.
+All speaker-volume writes go through one choke point, `streamer/safety.py`, whose rules
+are config-driven (`max_volume`, `office_names`, `allow_group_volume`). Shipped defaults
+are fully permissive — no cap, no protected devices, group volume allowed.
+`tests/test_no_rogue_volume.py` fails if any other module gains a volume call, and the
+test suite exercises the mechanism with restrictive rules.
 
 ## Tests
 
