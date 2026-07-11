@@ -93,6 +93,7 @@ class Popover:
 
         self._rows: dict[str, dict] = {}       # name -> widgets
         self._dragging: str | None = None      # device being volume-dragged
+        self._updating_ui = False              # programmatic slider set guard
         self._visible = False
 
         self._build_static()
@@ -272,6 +273,8 @@ class Popover:
         if w is None:
             return
         w["pct"].configure(text=f"{value:3.0f}%")
+        if self._updating_ui:
+            return  # programmatic set (arriving reading) - not a user action
         self.ctl.volumes.set_volume_debounced(name, value / 100.0)
 
     def _volume_arrived(self, name: str, level: float) -> None:
@@ -284,7 +287,11 @@ class Popover:
         if time.monotonic() - self.ctl.volumes.last_write.get(name, 0) < 1.5:
             return
         w["scale"].state(["!disabled"])
-        w["var"].set(level * 100)
+        self._updating_ui = True
+        try:
+            w["var"].set(level * 100)
+        finally:
+            self._updating_ui = False
         w["pct"].configure(text=f"{level * 100:3.0f}%")
 
     # ---- show/hide ------------------------------------------------------------------

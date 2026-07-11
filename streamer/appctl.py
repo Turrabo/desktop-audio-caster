@@ -69,6 +69,10 @@ class AppController:
         self._notify("state", state, detail)
 
     def _on_devices_changed(self) -> None:
+        # First discovery result ends the DISCOVERING state - without this the
+        # UI sits on "Finding speakers..." forever.
+        if self.state == "DISCOVERING" and self.discovery.list_devices():
+            self._set_state("IDLE")
         self._notify("devices")
 
     # -- ops (serialized) -----------------------------------------------------
