@@ -1,9 +1,9 @@
-"""Tkinter popover: cast targets (GROUPS / SPEAKERS), volume, status, startup.
+"""Google Home-style popover: status header, GROUPS / SPEAKERS device cards
+with cast toggles and volume sliders, startup toggle, exit.
 
-Threading: this module owns the Tk main thread. Everything arriving from other
-threads (controller events, pystray clicks, volume sweep results) comes in
-through ONE queue.Queue drained by a 50 ms after-loop. No tk call is ever made
-off-thread.
+Threading: this module owns the Tk main thread. Everything from other threads
+(controller events, pystray clicks, volume sweep results) arrives through ONE
+queue.Queue drained by a 50 ms after-loop. No tk call is ever made off-thread.
 """
 from __future__ import annotations
 
@@ -12,20 +12,20 @@ import logging
 import queue
 import time
 import tkinter as tk
-from tkinter import ttk
 
 from .. import startup
+from .widgets import (ACCENT, BG, CARD, ERROR, FONT, GOOD, SUBTEXT, TEXT,
+                      TRACK, WARN, DeviceIcon, IconButton, Slider, Toggle,
+                      rounded_rect)
 
 log = logging.getLogger(__name__)
 
 POLL_MS = 50
+MAGIC = "#010203"          # transparent-color key for rounded window corners
+WIDTH = 372
+RADIUS = 14
 
-STATE_COLORS = {
-    "IDLE": "#8a8a8a",
-    "PLAYING": "#4285f4",
-    "ERROR": "#d93025",
-}
-AMBER = "#f9ab00"
+STATE_DOT = {"IDLE": SUBTEXT, "PLAYING": GOOD, "ERROR": ERROR}
 
 STATE_TEXT = {
     "IDLE": "Not casting",
@@ -36,7 +36,7 @@ STATE_TEXT = {
     "BUFFERING": "{d} is buffering…",
     "RECONNECTING": "Reconnecting: {d}",
     "STOPPING": "Stopping…",
-    "ERROR": "Error: {d}",
+    "ERROR": "{d}",
 }
 
 
@@ -48,7 +48,6 @@ def _dpi_aware() -> None:
 
 
 def _work_area_at(x: int, y: int) -> tuple[int, int, int, int]:
-    """Work area (left, top, right, bottom) of the monitor containing x,y."""
     try:
         class RECT(ctypes.Structure):
             _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
@@ -86,24 +85,28 @@ class Popover:
         self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.configure(bg="#202124", padx=1, pady=1)
+        try:
+            self.win.attributes("-transparentcolor", MAGIC)
+        except tk.TclError:
+            pass
+        self.win.configure(bg=MAGIC)
 
-        self.frame = tk.Frame(self.win, bg="#2d2e31", padx=12, pady=10)
-        self.frame.pack(fill="both", expand=True)
+        # Rounded backdrop; content frame sits inside its margin so the
+        # corner curves stay visible.
+        self.backdrop = tk.Canvas(self.win, bg=MAGIC, highlightthickness=0)
+        self.backdrop.pack(fill="both", expand=True)
+        self.frame = tk.Frame(self.win, bg=BG)
 
-        self._rows: dict[str, dict] = {}       # name -> widgets
-        self._dragging: str | None = None      # device being volume-dragged
-        self._updating_ui = False              # programmatic slider set guard
+        self._rows: dict[str, dict] = {}
         self._visible = False
 
         self._build_static()
-        ctl.add_listener(self._on_ctl_event)   # arbitrary threads -> enqueue
+        ctl.add_listener(self._on_ctl_event)
         self.root.after(POLL_MS, self._drain)
 
-    # ---- cross-thread plumbing ------------------------------------------
+    # ---- cross-thread plumbing --------------------------------------------
 
     def post(self, fn) -> None:
-        """Safe from any thread."""
         self.ui_queue.put(fn)
 
     def _drain(self) -> None:
@@ -123,63 +126,71 @@ class Popover:
             state, detail = args
             self.post(lambda: self._apply_state(state, detail))
         elif kind == "devices":
-            self.post(self._rebuild_rows)
+            self.post(self._devices_changed)
         elif kind == "mute":
             engaged = args[0]
             self.post(lambda: self._mute_label(engaged))
 
-    # ---- static layout ---------------------------------------------------
+    # ---- static layout ------------------------------------------------------
 
     def _build_static(self) -> None:
         f = self.frame
-        status = tk.Frame(f, bg=f["bg"])
-        status.pack(fill="x", pady=(0, 8))
-        self.dot = tk.Canvas(status, width=12, height=12, bg=f["bg"],
+
+        header = tk.Frame(f, bg=BG)
+        header.pack(fill="x", pady=(2, 8))
+        self.dot = tk.Canvas(header, width=10, height=10, bg=BG,
                              highlightthickness=0)
-        self.dot_id = self.dot.create_oval(2, 2, 11, 11,
-                                           fill=STATE_COLORS["IDLE"], outline="")
-        self.dot.pack(side="left", padx=(0, 6))
-        self.status_lbl = tk.Label(status, text="Not casting", fg="#e8eaed",
-                                   bg=f["bg"], font=("Segoe UI", 10))
-        self.status_lbl.pack(side="left")
+        self.dot_id = self.dot.create_oval(1, 1, 9, 9, fill=SUBTEXT, outline="")
+        self.dot.pack(side="left", padx=(2, 8), pady=4)
+        self.status_lbl = tk.Label(header, text="Not casting", fg=TEXT, bg=BG,
+                                   font=(FONT, 11, "bold"), anchor="w")
+        self.status_lbl.pack(side="left", fill="x", expand=True)
 
-        self.mute_lbl = tk.Label(f, text="", fg="#9aa0a6", bg=f["bg"],
-                                 font=("Segoe UI", 8))
-        self.mute_lbl.pack(fill="x")
+        self.mute_lbl = tk.Label(f, text="", fg=SUBTEXT, bg=BG, font=(FONT, 8),
+                                 anchor="w")
+        self.mute_lbl.pack(fill="x", padx=2)
 
-        self.groups_frame = self._section("GROUPS")
-        self.speakers_frame = self._section("SPEAKERS")
+        self.groups_hdr = self._section_label("GROUPS")
+        self.groups_frame = tk.Frame(f, bg=BG)
+        self.groups_frame.pack(fill="x")
+        self.speakers_hdr = self._section_label("SPEAKERS")
+        self.speakers_frame = tk.Frame(f, bg=BG)
+        self.speakers_frame.pack(fill="x")
 
-        bottom = tk.Frame(f, bg=f["bg"])
-        bottom.pack(fill="x", pady=(10, 0))
-        self.startup_var = tk.BooleanVar(value=startup.is_enabled())
-        tk.Checkbutton(bottom, text="Start with Windows",
-                       variable=self.startup_var, command=self._toggle_startup,
-                       fg="#e8eaed", bg=f["bg"], selectcolor="#202124",
-                       activebackground=f["bg"], activeforeground="#e8eaed",
-                       font=("Segoe UI", 9)).pack(side="left")
-        tk.Button(bottom, text="Exit", command=self._exit, fg="#e8eaed",
-                  bg="#3c4043", activebackground="#5f6368", bd=0, padx=12,
-                  font=("Segoe UI", 9)).pack(side="right")
+        footer = tk.Frame(f, bg=BG)
+        footer.pack(fill="x", pady=(10, 2))
+        tk.Label(footer, text="Start with Windows", fg=SUBTEXT, bg=BG,
+                 font=(FONT, 9)).pack(side="left", padx=(2, 8))
+        self.startup_toggle = Toggle(footer, on_change=self._toggle_startup)
+        self.startup_toggle.pack(side="left")
+
+        exit_lbl = tk.Label(footer, text="Exit", fg=SUBTEXT, bg=BG,
+                            font=(FONT, 10), cursor="hand2", padx=10)
+        exit_lbl.pack(side="right")
+        exit_lbl.bind("<ButtonRelease-1>", lambda e: self._exit())
+        exit_lbl.bind("<Enter>", lambda e: exit_lbl.configure(fg=ERROR))
+        exit_lbl.bind("<Leave>", lambda e: exit_lbl.configure(fg=SUBTEXT))
 
         self.win.bind("<Escape>", lambda e: self.hide())
         self.win.bind("<FocusOut>", self._maybe_close)
 
-    def _section(self, title: str) -> tk.Frame:
-        lbl = tk.Label(self.frame, text=title, fg="#9aa0a6", bg=self.frame["bg"],
-                       font=("Segoe UI", 8, "bold"), anchor="w")
-        lbl.pack(fill="x", pady=(6, 2))
-        frame = tk.Frame(self.frame, bg=self.frame["bg"])
-        frame.pack(fill="x")
-        return frame
+    def _section_label(self, text: str) -> tk.Label:
+        lbl = tk.Label(self.frame, text=text, fg=SUBTEXT, bg=BG,
+                       font=(FONT, 8, "bold"), anchor="w")
+        lbl.pack(fill="x", pady=(8, 4), padx=2)
+        return lbl
 
-    # ---- device rows -----------------------------------------------------------
+    # ---- device cards ------------------------------------------------------
+
+    def _devices_changed(self) -> None:
+        self._rebuild_rows()
+        if self._visible:
+            self._resweep()
 
     def _rebuild_rows(self) -> None:
-        for child in self.groups_frame.winfo_children():
-            child.destroy()
-        for child in self.speakers_frame.winfo_children():
-            child.destroy()
+        for fr in (self.groups_frame, self.speakers_frame):
+            for child in fr.winfo_children():
+                child.destroy()
         self._rows.clear()
 
         devs = self.ctl.devices()
@@ -187,44 +198,74 @@ class Popover:
                                ("speakers", self.speakers_frame)):
             items = devs[section]
             if not items:
-                tk.Label(frame, text="(none found)", fg="#5f6368",
-                         bg=frame["bg"], font=("Segoe UI", 9)).pack(anchor="w")
+                tk.Label(frame, text="none found", fg=TRACK, bg=BG,
+                         font=(FONT, 9, "italic")).pack(anchor="w", padx=6)
             for d in items:
-                self._make_row(frame, d)
+                self._make_card(frame, d)
+
+        # Apply cached levels instantly - rebuilt sliders must never sit
+        # dead waiting for a sweep (the vanished-handles bug).
+        for name, level in self.ctl.volumes.known_levels.items():
+            self._volume_arrived(name, level, from_cache=True)
+        self._apply_state(self.ctl.state, self.ctl.state_detail)
         self._resize()
 
-    def _make_row(self, parent: tk.Frame, d: dict) -> None:
+    CARD_W = WIDTH - 24
+    CARD_H = 96
+    CARD_R = 12
+
+    def _make_card(self, parent: tk.Frame, d: dict) -> None:
         name = d["name"]
-        row = tk.Frame(parent, bg=parent["bg"])
-        row.pack(fill="x", pady=2)
+        cw = self.CARD_W
+        card = tk.Canvas(parent, width=cw, height=self.CARD_H, bg=BG,
+                         highlightthickness=0)
+        card.pack(pady=4)
 
-        is_target = self.ctl.cast_target == name
-        btn = tk.Button(row, text="■" if is_target else "▶", width=3, bd=0,
-                        fg="#ffffff", bg="#4285f4" if is_target else "#3c4043",
-                        activebackground="#5f6368",
-                        command=lambda: self._toggle_cast(name))
-        btn.pack(side="left", padx=(0, 8))
+        inner = tk.Frame(card, bg=CARD)
+        card.create_window(14, 10, window=inner, anchor="nw", width=cw - 28)
 
-        lbl = tk.Label(row, text=name, fg="#e8eaed", bg=row["bg"], width=16,
-                       anchor="w", font=("Segoe UI", 10))
-        lbl.pack(side="left")
+        top = tk.Frame(inner, bg=CARD)
+        top.pack(fill="x")
+        DeviceIcon(top, kind=d["type"], bg=CARD).pack(side="left", padx=(0, 10))
+        text_col = tk.Frame(top, bg=CARD)
+        text_col.pack(side="left", fill="x", expand=True)
+        tk.Label(text_col, text=name, fg=TEXT, bg=CARD, anchor="w",
+                 font=(FONT, 11, "bold")).pack(fill="x")
+        kind_line = ("Speaker group" if d["type"] == "group"
+                     else d.get("model") or "Speaker")
+        sub = tk.Label(text_col, text=kind_line, fg=SUBTEXT, bg=CARD,
+                       anchor="w", font=(FONT, 8))
+        sub.pack(fill="x")
+        btn = IconButton(top, on_click=lambda n=name: self._toggle_cast(n),
+                         bg=CARD)
+        btn.pack(side="right")
 
-        var = tk.DoubleVar(value=0)
-        scale = ttk.Scale(row, from_=0, to=100, orient="horizontal", length=110,
-                          variable=var,
-                          command=lambda v, n=name: self._on_slider(n, float(v)))
-        scale.state(["disabled"])  # enabled when its level arrives
-        scale.pack(side="left", padx=(6, 0))
-        scale.bind("<ButtonPress-1>", lambda e, n=name: self._drag_start(n))
-        scale.bind("<ButtonRelease-1>", lambda e, n=name: self._drag_end(n))
+        bottom = tk.Frame(inner, bg=CARD)
+        bottom.pack(fill="x", pady=(7, 0))
+        pct = tk.Label(bottom, text="–", fg=SUBTEXT, bg=CARD, width=5,
+                       anchor="e", font=(FONT, 9))
+        slider = Slider(
+            bottom,
+            on_change=lambda v, n=name: self._slider_change(n, v),
+            on_release=lambda v, n=name: self._slider_release(n, v),
+            bg=CARD, width=cw - 28 - 52)
+        slider.pack(side="left")
+        pct.pack(side="right")
 
-        pct = tk.Label(row, text="–", fg="#9aa0a6", bg=row["bg"], width=4,
-                       font=("Segoe UI", 8))
-        pct.pack(side="left")
+        # Size the card to its actual content, then paint the rounded
+        # backdrop UNDER the embedded frame (fixed heights clip the slider
+        # row on scaled DPI).
+        inner.update_idletasks()
+        ch = inner.winfo_reqheight() + 20
+        card.configure(height=ch)
+        rect = rounded_rect(card, 0, 0, cw, ch, self.CARD_R, fill=CARD,
+                            outline="")
+        card.tag_lower(rect)
 
-        self._rows[name] = {"button": btn, "scale": scale, "var": var, "pct": pct}
+        self._rows[name] = {"slider": slider, "button": btn, "sub": sub,
+                            "pct": pct, "kind_line": kind_line}
 
-    # ---- casting ---------------------------------------------------------------
+    # ---- casting -----------------------------------------------------------
 
     def _toggle_cast(self, name: str) -> None:
         if self.ctl.busy():
@@ -240,18 +281,21 @@ class Popover:
             detail, lag = detail.split("|", 1)
         text = STATE_TEXT.get(state, state).format(d=detail or "")
         if state == "PLAYING":
-            text = f"Casting to {detail}" + (f" — lag {lag} s" if lag else "")
-        color = STATE_COLORS.get(state, AMBER)
-        self.dot.itemconfigure(self.dot_id, fill=color)
+            text = f"Casting to {detail}"
+        self.dot.itemconfigure(self.dot_id, fill=STATE_DOT.get(state, WARN))
         self.status_lbl.configure(text=text)
 
         busy = self.ctl.busy()
         for name, w in self._rows.items():
             is_target = self.ctl.cast_target == name
-            w["button"].configure(
-                text="■" if is_target else "▶",
-                bg="#4285f4" if is_target else "#3c4043",
-                state="disabled" if busy else "normal")
+            w["button"].configure_state("stop" if is_target else "play",
+                                        enabled=not busy)
+            if is_target and state == "PLAYING":
+                w["sub"].configure(text=f"casting · lag {lag}s" if lag
+                                   else "casting", fg=ACCENT)
+            elif w["sub"].cget("fg") == ACCENT:
+                w["sub"].configure(fg=SUBTEXT)
+                self._refresh_sub(name)
 
     def _mute_label(self, engaged: bool) -> None:
         self.mute_lbl.configure(
@@ -259,40 +303,43 @@ class Popover:
 
     # ---- volume ---------------------------------------------------------------
 
-    def _drag_start(self, name: str) -> None:
-        self._dragging = name
-
-    def _drag_end(self, name: str) -> None:
-        self._dragging = None
-        w = self._rows.get(name)
-        if w and "disabled" not in w["scale"].state():
-            self.ctl.volumes.set_volume_debounced(name, w["var"].get() / 100.0)
-
-    def _on_slider(self, name: str, value: float) -> None:
-        w = self._rows.get(name)
-        if w is None:
-            return
-        w["pct"].configure(text=f"{value:3.0f}%")
-        if self._updating_ui or "disabled" in w["scale"].state():
-            return  # programmatic set or not-yet-initialised slider
+    def _slider_change(self, name: str, value: float) -> None:
+        self._refresh_sub(name, value)
         self.ctl.volumes.set_volume_debounced(name, value / 100.0)
 
-    def _volume_arrived(self, name: str, level: float) -> None:
+    def _slider_release(self, name: str, value: float) -> None:
+        self._refresh_sub(name, value)
+        self.ctl.volumes.set_volume_debounced(name, value / 100.0)
+
+    def _refresh_sub(self, name: str, value: float | None = None) -> None:
         w = self._rows.get(name)
         if w is None:
             return
-        # echo suppression: never fight an active drag or a fresh write
-        if self._dragging == name:
+        if value is None:
+            cached = self.ctl.volumes.known_levels.get(name)
+            value = cached * 100 if cached is not None else None
+        w["pct"].configure(text=f"{value:.0f}%" if value is not None else "–")
+        if self.ctl.cast_target != name:
+            w["sub"].configure(text=w["kind_line"], fg=SUBTEXT)
+
+    def _volume_arrived(self, name: str, level: float,
+                        from_cache: bool = False) -> None:
+        w = self._rows.get(name)
+        if w is None:
             return
-        if time.monotonic() - self.ctl.volumes.last_write.get(name, 0) < 1.5:
+        slider = w["slider"]
+        if slider.dragging:
             return
-        w["scale"].state(["!disabled"])
-        self._updating_ui = True
-        try:
-            w["var"].set(level * 100)
-        finally:
-            self._updating_ui = False
-        w["pct"].configure(text=f"{level * 100:3.0f}%")
+        if not from_cache and time.monotonic() - \
+                self.ctl.volumes.last_write.get(name, 0) < 1.5:
+            return
+        slider.set_value(level * 100)
+        self._refresh_sub(name, level * 100)
+
+    def _resweep(self) -> None:
+        names = [d["name"] for sec in self.ctl.devices().values() for d in sec]
+        self.ctl.volumes.open_sweep(
+            names, lambda n, lvl: self.post(lambda: self._volume_arrived(n, lvl)))
 
     # ---- show/hide ------------------------------------------------------------------
 
@@ -304,14 +351,9 @@ class Popover:
 
     def show(self) -> None:
         self._rebuild_rows()
-        self.startup_var.set(startup.is_enabled())
+        self.startup_toggle.set(startup.is_enabled())
         self._apply_state(self.ctl.state, self.ctl.state_detail)
-
-        # volume sweep: connections live only while the popover is open
-        names = [d["name"] for sec in self.ctl.devices().values() for d in sec]
-        self.ctl.volumes.open_sweep(
-            names, lambda n, lvl: self.post(lambda: self._volume_arrived(n, lvl)))
-
+        self._resweep()
         self.win.deiconify()
         self._resize()
         self._position()
@@ -326,51 +368,53 @@ class Popover:
         self.ctl.volumes.close_all()
 
     def _maybe_close(self, _event) -> None:
-        # Close only if focus genuinely left the popover's widget tree -
-        # slider/checkbox focus shifts inside the window must not close it.
         def check():
             focus = self.win.focus_get()
-            if focus is None or str(focus).startswith(str(self.win)) is False:
+            if focus is None or not str(focus).startswith(str(self.win)):
                 self.hide()
         self.win.after(60, check)
 
     def _resize(self) -> None:
-        self.win.update_idletasks()
-        w = max(320, self.frame.winfo_reqwidth() + 2)
-        h = self.frame.winfo_reqheight() + 2
+        self.frame.update_idletasks()
+        w = WIDTH
+        h = self.frame.winfo_reqheight() + 24
         self.win.geometry(f"{w}x{h}")
+        self.backdrop.configure(width=w, height=h)
+        self.backdrop.delete("all")
+        rounded_rect(self.backdrop, 0, 0, w, h, RADIUS, fill=BG, outline="#3a3a41")
+        self.backdrop.create_window(12, 12, window=self.frame, anchor="nw",
+                                    width=w - 24)
 
     def _position(self) -> None:
         self.win.update_idletasks()
         px, py = self.root.winfo_pointerxy()
-        w, h = self.win.winfo_width(), self.win.winfo_height()
+        w = self.win.winfo_width() or WIDTH
+        h = self.win.winfo_height()
         left, top, right, bottom = _work_area_at(px, py)
         x = min(max(px - w // 2, left + 8), right - w - 8)
-        y = py - h - 12
+        y = py - h - 14
         if y < top + 8:
-            y = min(py + 12, bottom - h - 8)
+            y = min(py + 14, bottom - h - 8)
         self.win.geometry(f"+{x}+{y}")
 
     # ---- startup / exit ------------------------------------------------------------------
 
-    def _toggle_startup(self) -> None:
+    def _toggle_startup(self, on: bool) -> None:
         try:
-            if self.startup_var.get():
+            if on:
                 startup.enable()
             else:
                 startup.disable()
         except Exception as e:
             log.warning("startup toggle failed: %s", e)
-            self.startup_var.set(startup.is_enabled())
+            self.startup_toggle.set(startup.is_enabled())
 
     def _exit(self) -> None:
         self.hide()
-        self.status_lbl.configure(text="Exiting…")
         self.on_exit()
 
     def run(self) -> None:
         self.root.mainloop()
 
     def quit(self) -> None:
-        """Callable from any thread."""
         self.post(self.root.destroy)

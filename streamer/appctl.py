@@ -191,6 +191,7 @@ class VolumeManager:
         self._lock = threading.Lock()
         self._debounce: dict[str, threading.Timer] = {}
         self.last_write: dict[str, float] = {}  # name -> monotonic time
+        self.known_levels: dict[str, float] = {}  # name -> last seen 0..1
 
     def _get_cast(self, name: str):
         session = self._ctl.session
@@ -212,6 +213,7 @@ class VolumeManager:
                 sc = self._get_cast(name)
                 level = sc.status.volume_level if sc.status else None
                 if level is not None:
+                    self.known_levels[name] = float(level)
                     on_level(name, float(level))
             except Exception as e:
                 log.debug("volume read %r failed: %s", name, e)
@@ -229,6 +231,7 @@ class VolumeManager:
 
         def fire():
             self.last_write[name] = time.monotonic()
+            self.known_levels[name] = level
             try:
                 info = self._ctl.discovery.find(name)
                 if info is not None and info.cast_type == "group":
@@ -265,6 +268,7 @@ class VolumeManager:
         log.info("group %r flatten: %s -> %.2f", group_name, names, level)
         for member in names:
             self.last_write[member] = time.monotonic()
+            self.known_levels[member] = level
             try:
                 msc = self._get_cast(member)
                 safety.set_volume(msc.unwrap_for_safety_module_only(), level,
