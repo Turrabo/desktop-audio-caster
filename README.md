@@ -17,8 +17,13 @@ True sub-second would need the Cast mirroring protocol — different project.
 ```
 .venv\Scripts\python cli.py devices                  # list speakers/groups
 .venv\Scripts\python cli.py start "Living Room"      # cast (Ctrl+C stops)
-.venv\Scripts\python -m streamer.tray                # tray app
+.venv\Scripts\pythonw.exe launch_tray.pyw            # tray app (windowless)
 ```
+
+Tray: left-click opens a popover (GROUPS / SPEAKERS) with cast toggles,
+per-device volume sliders, live status (grey idle / amber working / blue
+casting / red error), a start-with-Windows checkbox and Exit. Launching a
+second instance just pops the first one's popover. UI design: [docs/ui-plan.md](docs/ui-plan.md).
 
 Config + logs: `%APPDATA%\desktop-audio-streamer\`.
 

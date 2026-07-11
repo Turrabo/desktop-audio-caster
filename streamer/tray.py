@@ -1,7 +1,12 @@
-"""System tray UI.
+"""Tray icon (pystray) + entry point wiring icon, popover and controller.
 
-Menu: device list (radio), Start/Stop casting, Quit. Failures surface as
-tray notifications. Single-instance guarded by a localhost port bind.
+The icon is a view: left-click toggles the popover (never casts), right-click
+offers Open / Exit, and the glyph colour tracks controller state:
+grey idle, amber transitional, blue casting, red error.
+
+Single instance: a localhost guard port doubles as a control channel - a
+second launch sends SHOW to the first instance (which pops the popover) and
+exits, so autostart + manual launch is never a silent no-op.
 """
 from __future__ import annotations
 
@@ -13,152 +18,120 @@ import pystray
 from PIL import Image, ImageDraw
 
 from . import config as cfg_mod
-from .capture import LoopbackCapture
-from .caster import CastSession, Discovery
-from .localmute import LocalMute, recover_from_crash
-from .pacer import Pacer
-from .server import StreamServer
+from . import startup
+from .appctl import AppController, TRANSITIONAL_STATES
+from .ui.popover import Popover
 
 log = logging.getLogger(__name__)
 
 SINGLE_INSTANCE_PORT = 48765
 
+COLORS = {
+    "idle": (138, 138, 138, 255),
+    "busy": (249, 171, 0, 255),
+    "playing": (66, 133, 244, 255),
+    "error": (217, 48, 37, 255),
+}
 
-def _make_icon(active: bool) -> Image.Image:
+
+def _glyph(color) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    color = (66, 133, 244, 255) if active else (128, 128, 128, 255)
-    # speaker body + cone
     d.polygon([(14, 24), (26, 24), (38, 12), (38, 52), (26, 40), (14, 40)], fill=color)
-    if active:
-        d.arc([40, 20, 56, 44], start=-50, end=50, fill=color, width=4)
+    d.arc([40, 20, 56, 44], start=-50, end=50, fill=color, width=4)
     return img
+
+
+def _state_color(state: str):
+    if state == "PLAYING":
+        return COLORS["playing"]
+    if state == "ERROR":
+        return COLORS["error"]
+    if state in TRANSITIONAL_STATES:
+        return COLORS["busy"]
+    return COLORS["idle"]
 
 
 class TrayApp:
     def __init__(self):
-        self.cfg = cfg_mod.load()
-        self.discovery = Discovery()
-        self.capture: LoopbackCapture | None = None
-        self.pacer: Pacer | None = None
-        self.server: StreamServer | None = None
-        self.session: CastSession | None = None
-        self.mute = LocalMute()
-        self.selected: str | None = self.cfg["last_device"]
-        self.icon = pystray.Icon("desktop-audio-streamer", _make_icon(False),
-                                 "Desktop Audio Streamer", menu=self._menu())
+        self.ctl = AppController()
+        self.popover = Popover(self.ctl, on_exit=self._exit)
+        self.icon = pystray.Icon(
+            "desktop-audio-streamer", _glyph(COLORS["idle"]),
+            "Desktop Audio Streamer",
+            menu=pystray.Menu(
+                pystray.MenuItem("Open", self._show, default=True),
+                pystray.MenuItem("Exit", lambda icon, item: self._exit()),
+            ))
+        self.ctl.add_listener(self._on_event)
 
-    # -- single instance ---------------------------------------------------
+    # -- single instance + control channel ---------------------------------
 
-    def _claim_single_instance(self) -> bool:
+    def claim_instance(self) -> bool:
         self._guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self._guard.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
-            return True
         except OSError:
+            # An instance exists - ask it to show its popover, then bow out.
+            try:
+                with socket.create_connection(
+                        ("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=2) as s:
+                    s.sendall(b"SHOW\n")
+            except OSError:
+                pass
             return False
+        self._guard.listen(2)
+        threading.Thread(target=self._control_loop, name="instance-ctl",
+                         daemon=True).start()
+        return True
 
-    # -- menu ----------------------------------------------------------------
+    def _control_loop(self) -> None:
+        while True:
+            try:
+                conn, _ = self._guard.accept()
+                with conn:
+                    if b"SHOW" in conn.recv(16):
+                        self.popover.post(self.popover.show)
+            except OSError:
+                return
 
-    def _menu(self) -> pystray.Menu:
-        def device_item(name: str):
-            return pystray.MenuItem(
-                name,
-                lambda icon, item: self._select(name),
-                checked=lambda item, n=name: self.selected == n,
-                radio=True)
+    # -- events --------------------------------------------------------------
 
-        names = sorted({d["name"] for d in self.discovery.list_devices()})
-        device_items = [device_item(n) for n in names] or [
-            pystray.MenuItem("(discovering...)", None, enabled=False)]
-        return pystray.Menu(
-            pystray.MenuItem(
-                lambda item: "Stop casting" if self.session else "Start casting",
-                self._toggle, default=True),
-            pystray.Menu.SEPARATOR,
-            *device_items,
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Refresh devices", lambda icon, item: icon.update_menu()),
-            pystray.MenuItem("Quit", self._quit),
-        )
-
-    def _select(self, name: str) -> None:
-        self.selected = name
-        self.cfg["last_device"] = name
-        cfg_mod.save(self.cfg)
-
-    # -- casting ---------------------------------------------------------------
-
-    def _toggle(self, icon, item) -> None:
-        if self.session:
-            self._stop_cast()
-        else:
-            threading.Thread(target=self._start_cast, daemon=True).start()
-
-    def _start_cast(self) -> None:
-        if not self.selected:
-            self.icon.notify("Pick a speaker in the menu first", "No device selected")
+    def _on_event(self, kind: str, *args) -> None:
+        if kind != "state":
             return
-        try:
-            self.capture = LoopbackCapture(on_data=lambda d: self.pacer.feed(d),
-                                           device_hint=self.cfg["capture_device"])
-            self.server = StreamServer(self.capture.format, self.cfg["port"])
-            self.pacer = Pacer(self.capture.format, sink=self.server.feed)
-            self.server.start()
-            self.pacer.start()
-            self.capture.start()
+        state, detail = args
+        self.icon.icon = _glyph(_state_color(state))
+        if state == "PLAYING" and detail:
+            name = detail.split("|", 1)[0]
+            self.icon.title = f"Casting to {name}"
+        elif state == "ERROR":
+            self.icon.title = f"Error: {detail}"
+            try:
+                self.icon.notify(str(detail)[:200], "Desktop Audio Streamer")
+            except Exception:
+                pass
+        else:
+            self.icon.title = "Desktop Audio Streamer"
 
-            safe_cast = self.discovery.connect(self.selected)
-            if self.cfg["mute_local_while_casting"]:
-                self.mute.engage()
-            server, capture = self.server, self.capture
-            self.session = CastSession(
-                self.discovery, safe_cast, self.cfg["port"], self.cfg["stream_type"],
-                self.capture, on_event=lambda m: self.icon.notify(m, "Casting"),
-                sent_seconds_fn=lambda: (server.latest_client_bytes
-                                         / capture.format.bytes_per_second))
-            self.session.start()
-            self.icon.icon = _make_icon(True)
-            self.icon.update_menu()
-            self.icon.notify(f"Casting to {self.selected}", "Started")
-        except Exception as e:
-            log.exception("start cast failed")
-            self.icon.notify(str(e)[:220], "Cast failed")
-            self._teardown_pipeline()
+    def _show(self, icon=None, item=None) -> None:
+        # pystray thread -> marshal into the Tk thread
+        self.popover.post(self.popover.toggle)
 
-    def _stop_cast(self) -> None:
-        if self.session:
-            self.session.stop()
-            self.session = None
-        self.mute.release()
-        self._teardown_pipeline()
-        self.icon.icon = _make_icon(False)
-        self.icon.update_menu()
+    def _exit(self) -> None:
+        log.info("exit requested")
+        self.icon.visible = False
+        self.ctl.shutdown(then=lambda: (self.icon.stop(), self.popover.quit()))
 
-    def _teardown_pipeline(self) -> None:
-        for obj in (self.capture, self.pacer, self.server):
-            if obj is not None:
-                try:
-                    obj.stop()
-                except Exception as e:
-                    log.debug("teardown: %s", e)
-        self.capture = self.pacer = self.server = None
-
-    # -- lifecycle ---------------------------------------------------------------
-
-    def _quit(self, icon, item) -> None:
-        self._stop_cast()
-        self.discovery.stop()
-        icon.stop()
+    # -- lifecycle --------------------------------------------------------------
 
     def run(self) -> int:
-        if not self._claim_single_instance():
-            log.error("another instance is already running")
-            return 1
-        recover_from_crash()
-        self.discovery.wait_for_devices(4)
-        self.icon.menu = self._menu()
-        self.icon.run()
+        if not self.claim_instance():
+            log.info("another instance is running - asked it to show; exiting")
+            return 0
+        startup.repair_if_stale()
+        self.icon.run_detached()          # pystray gets its own thread
+        self.popover.run()                # tkinter owns the main thread
         return 0
 
 
