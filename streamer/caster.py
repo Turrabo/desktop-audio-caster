@@ -49,9 +49,11 @@ def source_ip_for(host: str) -> str:
 class Discovery:
     """Resident CastBrowser wrapper. Read-only; owns the uuid->name map."""
 
-    def __init__(self):
+    def __init__(self, on_change=None):
         self._zc = zeroconf.Zeroconf()
-        self._browser = CastBrowser(SimpleCastListener(lambda u, s: None), self._zc)
+        notify = (lambda *a: on_change()) if on_change else (lambda *a: None)
+        self._browser = CastBrowser(
+            SimpleCastListener(notify, notify, notify), self._zc)
         self._browser.start_discovery()
 
     def wait_for_devices(self, seconds: float = 6.0) -> None:
@@ -75,13 +77,13 @@ class Discovery:
                 return info
         return None
 
-    def connect(self, name: str) -> SafeCast:
+    def connect(self, name: str, timeout: float = 15) -> SafeCast:
         info = self.find(name)
         if info is None:
             known = ", ".join(sorted(i.friendly_name for i in self._browser.devices.values()))
             raise LookupError(f"device {name!r} not found. Known: {known}")
         cast = pychromecast.get_chromecast_from_cast_info(info, self._zc)
-        cast.wait(timeout=15)
+        cast.wait(timeout=timeout)
         return SafeCast(cast)
 
     def stop(self) -> None:
@@ -93,7 +95,8 @@ class CastSession:
     """One casting session to one device/group, with watchdog."""
 
     def __init__(self, discovery: Discovery, safe_cast: SafeCast, port: int,
-                 stream_type: str, capture, on_event=None, sent_seconds_fn=None):
+                 stream_type: str, capture, on_event=None, sent_seconds_fn=None,
+                 on_state=None, client_count_fn=None):
         self._discovery = discovery
         self._cast = safe_cast
         self._port = port
@@ -101,13 +104,27 @@ class CastSession:
         self._capture = capture
         self._on_event = on_event or (lambda msg: None)
         self._sent_seconds_fn = sent_seconds_fn
+        self._on_state = on_state or (lambda state, detail=None: None)
+        self._client_count_fn = client_count_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current_url = ""
         self._buffering_since: float | None = None
+        self._played_at = 0.0            # wall time playback last confirmed
         self._last_trim = 0.0
+        self._last_ui_state = ""
         self.recast_count = 0
         self.trim_count = 0
+
+    def _emit(self, state: str, detail: str | None = None) -> None:
+        key = f"{state}:{detail}"
+        if key != self._last_ui_state:
+            self._last_ui_state = key
+            self._on_state(state, detail)
+
+    @property
+    def safe_cast(self) -> SafeCast:
+        return self._cast
 
     # -- casting -----------------------------------------------------------
 
@@ -125,24 +142,33 @@ class CastSession:
         mc = self._cast.media_controller
         log.info("casting %s to %r (stream_type=%s)",
                  self._current_url, self._cast.name, self._stream_type)
+        self._emit("LAUNCHING", self._cast.name)
         mc.play_media(self._current_url, "audio/wav",
                       stream_type=self._stream_type, title="Desktop Audio")
         mc.block_until_active(timeout=15)
+        self._emit("WAITING_STREAM", self._cast.name)
+        self._played_at = time.monotonic()  # reset the no-client clock
 
     # -- watchdog ------------------------------------------------------------
 
     def _watchdog(self) -> None:
         backoff = BACKOFF_START
+        attempt = 0
         while not self._stop.is_set():
             time.sleep(WATCHDOG_PERIOD)
             try:
+                self._emit_player_state()
                 reason = self._failure_reason()
                 if reason is None:
                     backoff = BACKOFF_START
+                    attempt = 0
                     self._trim_lag()
                     continue
-                log.warning("watchdog: %s - re-casting in %.0f s", reason, backoff)
+                attempt += 1
+                log.warning("watchdog: %s - re-casting in %.0f s (attempt %d)",
+                            reason, backoff, attempt)
                 self._on_event(f"cast interrupted ({reason}), reconnecting")
+                self._emit("RECONNECTING", f"{reason} (attempt {attempt})")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, BACKOFF_CAP)
                 if self._stop.is_set():
@@ -150,6 +176,23 @@ class CastSession:
                 self._recover()
             except Exception as e:  # watchdog must never die
                 log.error("watchdog error: %s", e)
+
+    def _emit_player_state(self) -> None:
+        """Map live player state onto UI states each poll."""
+        mc = self._cast.media_controller
+        state = mc.status.player_state if mc.status else "UNKNOWN"
+        if state == "PLAYING":
+            self._played_at = time.monotonic()
+            lag = self.lag_seconds()
+            detail = self._cast.name if lag is None else f"{self._cast.name}|{lag:.1f}"
+            self._emit("PLAYING", detail)
+        elif state == "BUFFERING":
+            self._emit("BUFFERING", self._cast.name)
+        elif (self._client_count_fn is not None and self._client_count_fn() == 0
+                and time.monotonic() - self._played_at > 12):
+            # launched but the speaker never fetched (or lost) the stream
+            self._emit("ERROR",
+                       "speaker never fetched the stream - check firewall/port")
 
     def _failure_reason(self) -> str | None:
         if not self._capture.healthy:
@@ -210,7 +253,14 @@ class CastSession:
         name = self._cast.name
         try:
             fresh = self._discovery.connect(name)
+            old = self._cast
             self._cast = fresh
+            try:
+                # Disconnect the stale connection or its socket-client thread
+                # retries forever (one leaked thread per recovery).
+                old.disconnect(timeout=3)
+            except Exception:
+                pass
             self._play()
             self.recast_count += 1
             self._on_event("cast recovered")
