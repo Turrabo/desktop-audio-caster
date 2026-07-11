@@ -7,8 +7,10 @@ Built to replace SamDel's ChromeCast-Desktop-Audio-Streamer after it proved unre
 Reliability model: battle-tested [pychromecast](https://github.com/home-assistant-libs/pychromecast)
 for discovery/control, lossless PCM WAV over HTTP on the LAN (no encoder), one
 single-clock pacer so latency is fixed and can never drift, a resident discovery
-browser plus one watchdog for recovery. Latency is the Cast receiver's own buffer
-(~2-3 s, fixed) — see the plan for why sub-second needs a different protocol.
+browser plus one watchdog for recovery. The receiver pre-buffers ~9 s of live WAV;
+the watchdog auto-trims that by seeking to the live edge, landing at ~1.1 s end-to-end
+(~1.3 s for groups), measured. It re-trims automatically if lag ever creeps past 2 s.
+True sub-second would need the Cast mirroring protocol — different project.
 
 ## Use
 

@@ -8,8 +8,9 @@ single-clock pacing, network failure modes, HTTP contract.)
 ## User requirements
 
 - Whole-device audio (not per-tab / per-app).
-- Reliability and simplicity above all. Latency: fixed ~2-4 s accepted (D&D ambience, no lip
-  sync). The number is measured, not promised, and groups may sit at the high end.
+- Reliability and simplicity above all. Latency: measured ~1.1 s solo / ~1.3 s group after
+  watchdog auto-trim (seek past the receiver's ~9 s pre-buffer); user originally asked for
+  zero — sub-second remains a possible future mirroring-protocol project.
 - The laptop must not make audible sound while casting.
 - The app ships with NO volume guards (config defaults permissive). Volume restraint applies
   only to Claude-run testing: ≤3%, and no volume ops on "Office" (see project memory

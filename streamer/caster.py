@@ -27,6 +27,14 @@ WATCHDOG_PERIOD = 5.0
 BUFFERING_WEDGE_SECONDS = 60.0
 BACKOFF_START, BACKOFF_CAP = 2.0, 30.0
 
+# Lag auto-trim: the Default Media Receiver buffers ~9 s of live WAV before it
+# starts playing, and that backlog would persist forever (we stream realtime,
+# it never drains). Seeking forward WITHIN the receiver's buffer skips the
+# backlog without any HTTP interaction; measured floor is ~1.0 s end-to-end.
+TRIM_THRESHOLD_SECONDS = 2.0   # trim whenever lag exceeds this...
+TRIM_MARGIN_SECONDS = 0.4      # ...down to this much cushion above the edge
+TRIM_MIN_INTERVAL = 10.0       # never seek more often than this
+
 
 def source_ip_for(host: str) -> str:
     """The local IP the OS would route to `host` from - correct across NICs/VPNs."""
@@ -85,18 +93,21 @@ class CastSession:
     """One casting session to one device/group, with watchdog."""
 
     def __init__(self, discovery: Discovery, safe_cast: SafeCast, port: int,
-                 stream_type: str, capture, on_event=None):
+                 stream_type: str, capture, on_event=None, sent_seconds_fn=None):
         self._discovery = discovery
         self._cast = safe_cast
         self._port = port
         self._stream_type = stream_type
         self._capture = capture
         self._on_event = on_event or (lambda msg: None)
+        self._sent_seconds_fn = sent_seconds_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current_url = ""
         self._buffering_since: float | None = None
+        self._last_trim = 0.0
         self.recast_count = 0
+        self.trim_count = 0
 
     # -- casting -----------------------------------------------------------
 
@@ -128,6 +139,7 @@ class CastSession:
                 reason = self._failure_reason()
                 if reason is None:
                     backoff = BACKOFF_START
+                    self._trim_lag()
                     continue
                 log.warning("watchdog: %s - re-casting in %.0f s", reason, backoff)
                 self._on_event(f"cast interrupted ({reason}), reconnecting")
@@ -165,6 +177,33 @@ class CastSession:
             return "no route to speaker"
         return None
 
+    def lag_seconds(self) -> float | None:
+        """End-to-end lag: seconds of audio sent minus seconds played."""
+        if self._sent_seconds_fn is None:
+            return None
+        mc = self._cast.media_controller
+        if not mc.status or mc.status.player_state != "PLAYING":
+            return None
+        played = mc.status.adjusted_current_time
+        if played is None:
+            return None
+        return self._sent_seconds_fn() - played
+
+    def _trim_lag(self) -> None:
+        if time.monotonic() - self._last_trim < TRIM_MIN_INTERVAL:
+            return
+        lag = self.lag_seconds()
+        if lag is None or lag <= TRIM_THRESHOLD_SECONDS:
+            return
+        mc = self._cast.media_controller
+        played = mc.status.adjusted_current_time
+        target = played + lag - TRIM_MARGIN_SECONDS
+        log.info("trimming lag %.1fs -> ~%.1fs (seek %.1f -> %.1f)",
+                 lag, TRIM_MARGIN_SECONDS + 0.6, played, target)
+        mc.seek(target)
+        self._last_trim = time.monotonic()
+        self.trim_count += 1
+
     def _recover(self) -> None:
         # Re-resolve the device from live discovery (speaker may have a new IP
         # or the group leader may have migrated), then re-cast.
@@ -188,6 +227,10 @@ class CastSession:
             "url": self._current_url,
             "recasts": self.recast_count,
             "volume": getattr(self._cast.status, "volume_level", None),
+            # seconds of media the receiver has PLAYED (extrapolated between
+            # status messages); compare with seconds SENT for end-to-end lag
+            "played_seconds": (mc.status.adjusted_current_time
+                               if mc.status else None),
         }
 
     def stop(self) -> None:

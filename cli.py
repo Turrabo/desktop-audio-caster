@@ -67,8 +67,10 @@ def cmd_start(args) -> int:
         if cfg["mute_local_while_casting"] and not args.no_mute:
             mute.engage()
 
-        session = CastSession(disc, safe_cast, cfg["port"], stream_type, capture,
-                              on_event=lambda m: print(f"[event] {m}"))
+        session = CastSession(
+            disc, safe_cast, cfg["port"], stream_type, capture,
+            on_event=lambda m: print(f"[event] {m}"),
+            sent_seconds_fn=lambda: server.latest_client_bytes / capture.format.bytes_per_second)
         session.start()
 
         cfg["last_device"] = safe_cast.name
@@ -80,11 +82,11 @@ def cmd_start(args) -> int:
         while args.duration is None or time.time() - t0 < args.duration:
             time.sleep(10)
             s = session.status()
+            lag = session.lag_seconds()
+            lag_str = f"{lag:5.1f}s" if lag is not None else "  n/a"
             print(f"[{time.time()-t0:6.0f}s] state={s['player_state']} "
-                  f"vol={s['volume']} recasts={s['recasts']} "
-                  f"clients={server.client_count()} gets={server.get_count} "
-                  f"real={pacer.real_bytes_sent} silence={pacer.silence_bytes_sent} "
-                  f"dropped={pacer.dropped_bytes}")
+                  f"lag={lag_str} trims={session.trim_count} recasts={s['recasts']} "
+                  f"clients={server.client_count()} dropped={pacer.dropped_bytes}")
     except KeyboardInterrupt:
         print("\nstopping...")
         return 0

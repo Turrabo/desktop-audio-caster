@@ -111,9 +111,12 @@ class TrayApp:
             safe_cast = self.discovery.connect(self.selected)
             if self.cfg["mute_local_while_casting"]:
                 self.mute.engage()
+            server, capture = self.server, self.capture
             self.session = CastSession(
                 self.discovery, safe_cast, self.cfg["port"], self.cfg["stream_type"],
-                self.capture, on_event=lambda m: self.icon.notify(m, "Casting"))
+                self.capture, on_event=lambda m: self.icon.notify(m, "Casting"),
+                sent_seconds_fn=lambda: (server.latest_client_bytes
+                                         / capture.format.bytes_per_second))
             self.session.start()
             self.icon.icon = _make_icon(True)
             self.icon.update_menu()

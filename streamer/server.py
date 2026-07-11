@@ -20,7 +20,7 @@ from .capture import CaptureFormat
 
 log = logging.getLogger(__name__)
 
-CLIENT_QUEUE_SECONDS = 1.0
+CLIENT_QUEUE_SECONDS = 0.3
 
 
 def wav_header(fmt: CaptureFormat) -> bytes:
@@ -45,6 +45,9 @@ class StreamServer:
         self._started = threading.Event()
         self._runner: web.AppRunner | None = None
         self.get_count = 0
+        # latest client's delivery counters (for end-to-end lag estimation)
+        self.latest_client_bytes = 0
+        self.latest_client_connected_at = 0.0
 
     # -- feeding (called from pacer thread) ---------------------------------
 
@@ -89,10 +92,14 @@ class StreamServer:
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         with self._clients_lock:
             self._clients.add(q)
+        import time as _time
+        self.latest_client_bytes = 0
+        self.latest_client_connected_at = _time.monotonic()
         try:
             while True:
                 chunk = await q.get()
                 await resp.write(chunk)
+                self.latest_client_bytes += len(chunk)
         except (ConnectionResetError, asyncio.CancelledError, Exception) as e:
             log.info("stream client disconnected: %s (%s)", peer, type(e).__name__)
         finally:
