@@ -15,30 +15,43 @@ import socket
 import threading
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from . import config as cfg_mod
 from . import startup
 from .appctl import AppController, TRANSITIONAL_STATES
+from .ui.fonts import ASSETS, ICONS
 from .ui.popover import Popover
 
 log = logging.getLogger(__name__)
 
 SINGLE_INSTANCE_PORT = 48765
 
+# GM3-dark state tints for the standard Cast glyph
 COLORS = {
-    "idle": (138, 138, 138, 255),
-    "busy": (249, 171, 0, 255),
-    "playing": (66, 133, 244, 255),
-    "error": (217, 48, 37, 255),
+    "idle": (196, 199, 197, 255),     # on-surface-variant
+    "busy": (253, 214, 99, 255),      # amber
+    "playing": (168, 199, 250, 255),  # primary
+    "error": (242, 184, 181, 255),    # error
 }
 
+_icon_font = None
 
-def _glyph(color) -> Image.Image:
+
+def _glyph(color, connected: bool = False) -> Image.Image:
+    """The standardised Chromecast icon (Material 'cast' glyph), tinted."""
+    global _icon_font
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.polygon([(14, 24), (26, 24), (38, 12), (38, 52), (26, 40), (14, 40)], fill=color)
-    d.arc([40, 20, 56, 44], start=-50, end=50, fill=color, width=4)
+    try:
+        if _icon_font is None:
+            _icon_font = ImageFont.truetype(
+                str(ASSETS / "MaterialIconsRound-Regular.otf"), 58)
+        char = ICONS["cast_connected"] if connected else ICONS["cast"]
+        d.text((32, 32), char, font=_icon_font, fill=color, anchor="mm")
+    except OSError as e:
+        log.warning("icon font unavailable (%s); drawing fallback", e)
+        d.rounded_rectangle([6, 12, 58, 48], radius=6, outline=color, width=5)
     return img
 
 
@@ -101,7 +114,7 @@ class TrayApp:
         if kind != "state":
             return
         state, detail = args
-        self.icon.icon = _glyph(_state_color(state))
+        self.icon.icon = _glyph(_state_color(state), connected=state == "PLAYING")
         if state == "PLAYING" and detail:
             name = detail.split("|", 1)[0]
             self.icon.title = f"Casting to {name}"
