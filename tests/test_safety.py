@@ -75,6 +75,16 @@ class TestGroupRules(unittest.TestCase):
                 safety.set_volume(fake_cast(name="Everywhere", cast_type="group"),
                                   0.01, cfg, {})
 
+    def test_group_short_circuits_when_no_protected_names(self):
+        # Permissive config (shipped defaults): no protected devices means no
+        # multizone round-trip - the write must go straight through.
+        cfg = dict(CFG, allow_group_volume=True, office_names=[])
+        cast = fake_cast(name="Everywhere", cast_type="group")
+        with mock.patch.object(safety, "resolve_group_members",
+                               side_effect=AssertionError("must not resolve")):
+            safety.set_volume(cast, 0.02, cfg)
+        cast.set_volume.assert_called_once_with(0.02)
+
     def test_group_clean_members_allowed_when_enabled(self):
         cfg = dict(CFG, allow_group_volume=True)
         devices = {"u-kitchen": "Kitchen", "u-living": "Living Room"}

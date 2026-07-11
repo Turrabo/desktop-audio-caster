@@ -35,10 +35,20 @@ def _is_protected(name: str | None, office_names: list[str]) -> bool:
 
 
 def resolve_group_members(cast: pychromecast.Chromecast, timeout: float = 5.0) -> list[str] | None:
-    """Return member UUID strings for a group, or None if unresolvable."""
+    """Return member UUID strings for a group, or None if unresolvable.
+
+    The MultizoneController is cached on the cast object - pychromecast has no
+    handler-unregister, so creating one per call would leak handlers on the
+    socket client.
+    """
     if cast.cast_type != "group":
         return []
-    mz = MultizoneController(cast.uuid)
+    mz = getattr(cast, "_das_multizone", None)
+    if mz is None:
+        mz = MultizoneController(cast.uuid)
+        cast.register_handler(mz)
+        cast._das_multizone = mz
+
     event = threading.Event()
 
     class Listener:
@@ -52,7 +62,6 @@ def resolve_group_members(cast: pychromecast.Chromecast, timeout: float = 5.0) -
             event.set()
 
     mz.register_listener(Listener())
-    cast.register_handler(mz)
     mz.update_members()
     if not event.wait(timeout):
         return None
@@ -87,6 +96,11 @@ def set_volume(
             raise SafetyError(
                 "group volume changes are disabled (allow_group_volume=false) - "
                 "group volume rescales every member's own volume")
+        if not office_names:
+            # Nothing to protect - skip the multizone round-trip entirely.
+            log.info("safety: setting volume of group %r to %.3f", cast.name, level)
+            cast.set_volume(level)
+            return
         members = resolve_group_members(cast)
         if members is None:
             raise SafetyError(

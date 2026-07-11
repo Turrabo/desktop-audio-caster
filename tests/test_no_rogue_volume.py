@@ -9,7 +9,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PATTERN = re.compile(r"\.(set_volume|volume_up|volume_down)\s*\(")
+# Direct volume calls on cast objects are forbidden; calling the sanctioned
+# entry point safety.set_volume(...) is allowed anywhere.
+PATTERN = re.compile(r"(?<!safety)\.(set_volume|volume_up|volume_down)\s*\(")
 
 
 class TestNoRogueVolumeCalls(unittest.TestCase):
