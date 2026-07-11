@@ -1,8 +1,10 @@
-"""Private font loading (Windows GDI) for the bundled Google icon font.
+"""Private font loading (Windows GDI) for the bundled Google fonts.
 
-Material Icons Round (Apache 2.0, google/material-design-icons) ships in
-assets/; AddFontResourceExW with FR_PRIVATE makes it usable by this process
-only - no system install, no admin.
+Roboto Regular/Medium (UI text) and Material Icons Round (glyphs) ship in
+assets/ (all Apache 2.0); AddFontResourceExW with FR_PRIVATE makes them usable
+by this process only - no system install, no admin. Tk uses the GDI families;
+the PIL render layer loads the icon OTF by file path (render.py), as does the
+tray glyph (tray.py). Falls back to Segoe UI when Roboto is missing.
 """
 from __future__ import annotations
 
@@ -15,7 +17,11 @@ log = logging.getLogger(__name__)
 ASSETS = Path(__file__).resolve().parents[2] / "assets"
 FR_PRIVATE = 0x10
 
-ICON_FONT = "Material Icons Round"
+ICON_FONT_PATH = ASSETS / "MaterialIconsRound-Regular.otf"
+
+# UI families, resolved by ensure_fonts(); Segoe fallbacks until then.
+FONT = "Segoe UI"
+MEDIUM = "Segoe UI Semibold"
 
 # Material Icons codepoints (identical across Google icon families).
 # chr() form keeps this file pure ASCII.
@@ -28,22 +34,29 @@ ICONS = {
     "play": chr(0xE037),
     "stop": chr(0xE047),
     "check": chr(0xE5CA),
+    "error": chr(0xE000),
 }
 
 _loaded = False
 
 
-def ensure_fonts() -> bool:
-    """Load bundled fonts for this process. Returns True if usable."""
-    global _loaded
-    if _loaded:
-        return True
-    path = ASSETS / "MaterialIconsRound-Regular.otf"
+def _add_private(path: Path) -> bool:
     if not path.exists():
-        log.warning("icon font missing at %s - falling back to text glyphs", path)
+        log.warning("font missing at %s", path)
         return False
-    added = ctypes.windll.gdi32.AddFontResourceExW(str(path), FR_PRIVATE, 0)
-    _loaded = added > 0
-    if not _loaded:
-        log.warning("AddFontResourceExW failed for %s", path)
-    return _loaded
+    return ctypes.windll.gdi32.AddFontResourceExW(str(path), FR_PRIVATE, 0) > 0
+
+
+def ensure_fonts() -> None:
+    """Load bundled fonts for this process; resolve the UI family names."""
+    global _loaded, FONT, MEDIUM
+    if _loaded:
+        return
+    _loaded = True
+    if (_add_private(ASSETS / "Roboto-Regular.ttf")
+            and _add_private(ASSETS / "Roboto-Medium.ttf")):
+        FONT, MEDIUM = "Roboto", "Roboto Medium"
+    else:
+        log.warning("Roboto unavailable - using Segoe UI")
+    if not _add_private(ICON_FONT_PATH):
+        log.warning("icon font unavailable - glyphs will render as boxes")

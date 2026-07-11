@@ -40,8 +40,10 @@ PLAYING / RECONNECTING(reason, attempt) / STOPPING / ERROR(msg).
 
 - Tray glyph: grey IDLE, amber transitional (incl. BUFFERING, RECONNECTING),
   blue PLAYING, red ERROR.
-- Popover status bar: dot + text ("Casting to Everywhere — lag 1.1 s",
-  "Speaker buffering…", "Reconnecting (attempt 3): capture unhealthy").
+- Popover header: state-tinted cast icon + text ("Casting to Everywhere",
+  "Speaker buffering…", "Reconnecting: …"); errors surface in a wrapping
+  error-container banner under the header; the active card shows an accent
+  badge and "Casting · lag X s" subtitle.
 - CastSession gains on_state + client_count_fn: cast launched but no HTTP GET
   within 12 s -> ERROR("speaker never fetched the stream - check firewall").
 - Sustained BUFFERING surfaces immediately (not hidden for the 60 s wedge
@@ -54,7 +56,10 @@ PLAYING / RECONNECTING(reason, attempt) / STOPPING / ERROR(msg).
   closes ONLY if focus_get() is no longer inside this toplevel's widget tree
   (slider/checkbox focus changes don't close it); ESC closes; tray click
   toggles.
-- DPI: SetProcessDpiAwareness(2) at startup (ctypes, try/except).
+- DPI: per-monitor awareness (v2 context, shcore/user32 fallbacks); every
+  metric and font size scales via dp() from the DPI of the monitor under the
+  cursor at show() time; content taller than the work area scrolls inside a
+  height-capped region.
 - Position near cursor, clamped to the current monitor's WORK AREA via
   MonitorFromPoint + GetMonitorInfo (ctypes) - never under the taskbar or
   off-screen.

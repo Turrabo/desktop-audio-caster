@@ -1,5 +1,16 @@
-"""Material 3 dark popover (Google Home idiom): cast-state header with chip,
-Groups / Speakers device cards, M3 sliders, switch, exit.
+"""Material 3 dark popover (Google Home idiom) with native Win11 chrome:
+cast-state header, error banner, Groups / Speakers device cards in a
+height-capped scroll region, M3 sliders, switch, exit.
+
+Chrome: a plain solid-surface toplevel; DWM rounds the corners and draws the
+flyout shadow (DWMWA_WINDOW_CORNER_PREFERENCE - verified on Win11 to round,
+shadow, and survive -alpha fades on an overrideredirect Tk window; pre-Win11
+machines just get square corners). No color-key transparency.
+
+Scale: every metric and font size goes through dp() from the DPI of the
+monitor under the cursor, probed at show() time (DAS_UI_SCALE env overrides
+for screenshots); a scale change rebuilds the whole widget tree and clears
+the render cache.
 
 Threading: this module owns the Tk main thread. Everything from other threads
 (controller events, pystray clicks, volume sweep results) arrives through ONE
@@ -9,23 +20,25 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import queue
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 
 from .. import startup
-from .fonts import ICON_FONT, ICONS
-from .widgets import (ACCENT, BG, CARD, CHIP_BG, CHIP_FG, ERROR_BG, ERROR_FG,
-                      FONT, OUTLINE_VAR, SEMIBOLD, SUBTEXT, TEXT, WARN,
-                      DeviceIcon, IconButton, Slider, Toggle, rounded_rect)
+from . import fonts, render
+from .widgets import (ACCENT, BG, CARD, DIVIDER, ERROR, ERROR_BG, ERROR_FG,
+                      SUBTEXT, TEXT, WARN, DeviceIcon, IconButton, Slider,
+                      TextButton, Toggle, ellipsize)
 
 log = logging.getLogger(__name__)
 
 POLL_MS = 50
-MAGIC = "#010203"          # transparent-color key for rounded window corners
-WIDTH = 372
-RADIUS = 28                # M3 extra-large container
-MARGIN = 16                # window inner margin
+BASE_W = 392               # logical window width (dp)
+MARGIN = 20                # logical outer margin
+GUTTER = 8                 # scroll-thumb gutter inside the content column
+BORDER_COLORREF = 0x0033312F   # DWM hairline, 0x00BBGGRR of #2F3133
 
 STATE_TEXT = {
     "IDLE": "Not casting",
@@ -36,18 +49,32 @@ STATE_TEXT = {
     "BUFFERING": "{d} is buffering…",
     "RECONNECTING": "Reconnecting: {d}",
     "STOPPING": "Stopping…",
-    "ERROR": "{d}",
 }
 
 
-def _dpi_aware() -> None:
+def _dpi_aware() -> str:
+    user32 = ctypes.windll.user32
+    try:
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except (AttributeError, OSError):
+        pass
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return "per-monitor"
     except Exception:
         pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    return "system"
 
 
-def _work_area_at(x: int, y: int) -> tuple[int, int, int, int]:
+def _monitor_info_at(x: int, y: int) -> tuple[tuple[int, int, int, int], float]:
+    """Work area and DPI scale of the monitor containing (x, y)."""
     try:
         class RECT(ctypes.Structure):
             _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
@@ -65,18 +92,22 @@ def _work_area_at(x: int, y: int) -> tuple[int, int, int, int]:
         mi.cbSize = ctypes.sizeof(MONITORINFO)
         ctypes.windll.user32.GetMonitorInfoW(mon, ctypes.byref(mi))
         w = mi.rcWork
-        return w.left, w.top, w.right, w.bottom
+        try:
+            dx, dy = ctypes.c_uint(), ctypes.c_uint()
+            ctypes.windll.shcore.GetDpiForMonitor(
+                mon, 0, ctypes.byref(dx), ctypes.byref(dy))
+            scale = dx.value / 96.0
+        except Exception:
+            scale = 1.0
+        return (w.left, w.top, w.right, w.bottom), scale
     except Exception:
-        return 0, 0, 1920, 1040
+        return (0, 0, 1920, 1040), 1.0
 
 
 class Popover:
-    CARD_W = WIDTH - 2 * MARGIN
-    CARD_R = 20
-    CARD_PAD = 16
-
     def __init__(self, ctl, on_exit):
-        _dpi_aware()
+        log.debug("dpi awareness: %s", _dpi_aware())
+        fonts.ensure_fonts()
         self.ctl = ctl
         self.on_exit = on_exit
         self.ui_queue: queue.Queue = queue.Queue()
@@ -89,22 +120,33 @@ class Popover:
         self.win.withdraw()
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        try:
-            self.win.attributes("-transparentcolor", MAGIC)
-        except tk.TclError:
-            pass
-        self.win.configure(bg=MAGIC)
-
-        self.backdrop = tk.Canvas(self.win, bg=MAGIC, highlightthickness=0)
-        self.backdrop.pack(fill="both", expand=True)
-        self.frame = tk.Frame(self.win, bg=BG)
+        self.win.configure(bg=BG)
 
         self._rows: dict[str, dict] = {}
         self._visible = False
+        self._fade_after: str | None = None
+        self._pending_rebuild = False
+        self._last_sig = None
+        self._wa = None
+        self._anchor: tuple[int, int] | None = None
+        self._h = 0
+        self._scrollable = False
+        self._wacc = self._sacc = 0.0
+        try:
+            self._scale_override = float(os.environ.get("DAS_UI_SCALE", ""))
+        except ValueError:
+            self._scale_override = None
 
-        self._build_static()
+        self.scale = 0.0
+        self._build_static(self._scale_override or 1.0)
+
+        self.win.bind("<Escape>", lambda e: self.hide())
+        self.win.bind("<FocusOut>", self._maybe_close)
         ctl.add_listener(self._on_ctl_event)
         self.root.after(POLL_MS, self._drain)
+
+    def dp(self, v: float) -> int:
+        return round(v * self.scale)
 
     # ---- cross-thread plumbing --------------------------------------------
 
@@ -135,90 +177,180 @@ class Popover:
 
     # ---- static layout ------------------------------------------------------
 
-    def _build_static(self) -> None:
-        f = self.frame
+    def _build_static(self, scale: float) -> None:
+        """(Re)build the whole widget tree at the given DPI scale."""
+        self.scale = scale
+        render.clear_cache()
+        for child in self.win.winfo_children():
+            child.destroy()
+        self._rows.clear()
+        self._last_sig = None
+        self._banner_visible = False
+        self._mute_packed = False
+        dp = self.dp
 
-        header = tk.Frame(f, bg=BG)
-        header.pack(fill="x", pady=(4, 12))
-        self.header_icon = tk.Label(header, text=ICONS["cast"], fg=SUBTEXT,
-                                    bg=BG, font=(ICON_FONT, -22))
-        self.header_icon.pack(side="left", padx=(2, 10))
-        self.status_lbl = tk.Label(header, text="Not casting", fg=TEXT, bg=BG,
-                                   font=(SEMIBOLD, -16), anchor="w")
+        self.win_w = dp(BASE_W)
+        self.content_w = self.win_w - 2 * dp(MARGIN)
+        self.card_w = self.content_w - dp(GUTTER)
+        self._ss = render.supersample(scale)
+        self._f_name = tkfont.Font(family=fonts.MEDIUM, size=-dp(16))
+        self._f_sub = tkfont.Font(family=fonts.FONT, size=-dp(14))
+
+        f = self.frame = tk.Frame(self.win, bg=BG)
+        f.pack(fill="both", expand=True, padx=dp(MARGIN),
+               pady=(dp(14), dp(14)))
+
+        self.header = tk.Frame(f, bg=BG)
+        self.header.pack(fill="x", pady=(0, dp(6)))
+        self.header_icon = tk.Label(self.header, bg=BG)
+        self.header_icon.pack(side="left", padx=(dp(2), dp(12)))
+        self.status_lbl = tk.Label(
+            self.header, text="Not casting", fg=TEXT, bg=BG, anchor="w",
+            justify="left", font=(fonts.MEDIUM, -dp(16)),
+            wraplength=self.content_w - dp(44))
         self.status_lbl.pack(side="left", fill="x", expand=True)
+        self._set_header_icon("cast", SUBTEXT)
 
-        # chip canvas (pill) shown only for PLAYING / ERROR
-        self.chip = tk.Canvas(f, height=32, bg=BG, highlightthickness=0)
-        self.chip_visible = False
+        self.banner = tk.Canvas(f, bg=BG, highlightthickness=0,
+                                width=self.content_w)
 
         self.mute_lbl = tk.Label(f, text="", fg=SUBTEXT, bg=BG,
-                                 font=(FONT, -12), anchor="w")
-        self.mute_lbl.pack(fill="x", padx=2)
+                                 font=(fonts.FONT, -dp(12)), anchor="w")
 
-        self.groups_hdr = self._section_label("Groups")
-        self.groups_frame = tk.Frame(f, bg=BG)
-        self.groups_frame.pack(fill="x")
-        self.speakers_hdr = self._section_label("Speakers")
-        self.speakers_frame = tk.Frame(f, bg=BG)
-        self.speakers_frame.pack(fill="x")
+        self.host = tk.Frame(f, bg=BG)
+        self.host.pack(fill="both", expand=True, pady=(dp(4), 0))
+        self.scroll_canvas = tk.Canvas(
+            self.host, bg=BG, highlightthickness=0,
+            width=self.content_w - dp(GUTTER), yscrollincrement=dp(20))
+        self.scroll_canvas.pack(side="left", fill="y")
+        self.thumb = tk.Canvas(self.host, width=dp(4), bg=BG,
+                               highlightthickness=0)
+        self.thumb.pack(side="right", fill="y", padx=(dp(4), 0))
+        self.devices_frame = tk.Frame(self.scroll_canvas, bg=BG)
+        self.scroll_canvas.create_window(
+            0, 0, window=self.devices_frame, anchor="nw",
+            width=self.content_w - dp(GUTTER))
+        self.devices_frame.bind("<Configure>", self._on_devices_configure)
 
+        tk.Frame(f, bg=DIVIDER, height=max(1, dp(1))).pack(
+            fill="x", pady=(dp(12), 0))
         footer = tk.Frame(f, bg=BG)
-        footer.pack(fill="x", pady=(16, 4))
-        tk.Label(footer, text="Start with Windows", fg=SUBTEXT, bg=BG,
-                 font=(FONT, -14)).pack(side="left", padx=(2, 12))
-        self.startup_toggle = Toggle(footer, on_change=self._toggle_startup)
+        footer.pack(fill="x", pady=(dp(10), 0))
+        tk.Label(footer, text="Start with Windows", fg=TEXT, bg=BG,
+                 font=(fonts.FONT, -dp(14))).pack(side="left", padx=(dp(2), dp(12)))
+        self.startup_toggle = Toggle(footer, self.scale,
+                                     on_change=self._toggle_startup)
         self.startup_toggle.pack(side="left")
+        TextButton(footer, self.scale, "Exit", self._exit).pack(side="right")
 
-        exit_lbl = tk.Label(footer, text="Exit", fg=SUBTEXT, bg=BG,
-                            font=(FONT, -14), cursor="hand2", padx=12)
-        exit_lbl.pack(side="right")
-        exit_lbl.bind("<ButtonRelease-1>", lambda e: self._exit())
-        exit_lbl.bind("<Enter>", lambda e: exit_lbl.configure(fg=TEXT))
-        exit_lbl.bind("<Leave>", lambda e: exit_lbl.configure(fg=SUBTEXT))
+    def _set_header_icon(self, name: str, color: str) -> None:
+        dp = self.dp
+        box, px = dp(26), dp(24)
+        key = ("hicon", name, color, box, self._ss)
+        ph = render.photo(key, box, box, self._ss, BG,
+                          lambda d, k: render.glyph(d, box * k / 2, box * k / 2,
+                                                    name, px * k, color))
+        self.header_icon.configure(image=ph)
+        self.header_icon._ph = ph
 
-        self.win.bind("<Escape>", lambda e: self.hide())
-        self.win.bind("<FocusOut>", self._maybe_close)
+    # ---- error banner (fixed, above the scroll region) ---------------------
 
-    def _section_label(self, text: str) -> tk.Label:
-        lbl = tk.Label(self.frame, text=text, fg=SUBTEXT, bg=BG,
-                       font=(SEMIBOLD, -14), anchor="w")
-        lbl.pack(fill="x", pady=(16, 8), padx=2)
-        return lbl
+    def _show_banner(self, text: str) -> None:
+        dp, c = self.dp, self.banner
+        c.delete("all")
+        wrap = self.content_w - dp(44) - dp(16)
+        font = (fonts.FONT, -dp(14))
+        tmp = c.create_text(0, 0, text=text, font=font, width=wrap, anchor="nw")
+        x1, y1, x2, y2 = c.bbox(tmp)
+        c.delete(tmp)
+        h = max(dp(46), (y2 - y1) + 2 * dp(13))
+        cw = self.content_w
+
+        def paint(d, k):
+            d.rounded_rectangle([0, 0, cw * k, h * k], radius=dp(12) * k,
+                                fill=ERROR_BG)
+            render.glyph(d, dp(26) * k, h * k / 2, "error", dp(20) * k,
+                         ERROR_FG)
+
+        ph = render.photo(("banner", cw, h, self._ss), cw, h, self._ss, BG,
+                          paint)
+        c.configure(height=h)
+        c.create_image(0, 0, anchor="nw", image=ph)
+        c._ph = ph
+        c.create_text(dp(44), h / 2, text=text, font=font, fill=ERROR_FG,
+                      width=wrap, anchor="w")
+        if not self._banner_visible:
+            c.pack(fill="x", pady=(dp(2), dp(4)), after=self.header)
+            self._banner_visible = True
+
+    def _hide_banner(self) -> None:
+        if self._banner_visible:
+            self.banner.pack_forget()
+            self._banner_visible = False
+
+    def _mute_label(self, engaged: bool) -> None:
+        if engaged and not self._mute_packed:
+            self.mute_lbl.configure(text="PC output muted while casting")
+            self.mute_lbl.pack(fill="x", padx=self.dp(2),
+                               pady=(0, self.dp(2)), before=self.host)
+            self._mute_packed = True
+        elif not engaged and self._mute_packed:
+            self.mute_lbl.pack_forget()
+            self._mute_packed = False
 
     # ---- device cards ------------------------------------------------------
 
+    def _any_dragging(self) -> bool:
+        return any(r["slider"].dragging for r in self._rows.values())
+
     def _devices_changed(self) -> None:
+        if self._any_dragging():
+            self._pending_rebuild = True
+            return
         self._rebuild_rows()
         if self._visible:
             self._resweep()
 
     def _rebuild_rows(self) -> None:
-        for fr in (self.groups_frame, self.speakers_frame):
-            for child in fr.winfo_children():
-                child.destroy()
+        keep = self.scroll_canvas.yview()[0]
+        for child in self.devices_frame.winfo_children():
+            child.destroy()
         self._rows.clear()
+        dp = self.dp
 
         devs = self.ctl.devices()
-        for section, frame in (("groups", self.groups_frame),
-                               ("speakers", self.speakers_frame)):
-            items = devs[section]
-            if not items:
-                tk.Label(frame, text="none found", fg=SUBTEXT, bg=BG,
-                         font=(FONT, -13, "italic")).pack(anchor="w", padx=6)
-            for d in items:
-                self._make_card(frame, d)
+        if not devs["groups"] and not devs["speakers"]:
+            tk.Label(self.devices_frame, text="No speakers found yet",
+                     fg=SUBTEXT, bg=BG, font=(fonts.FONT, -dp(14))
+                     ).pack(pady=dp(24))
+        else:
+            first = True
+            for title, items in (("Groups", devs["groups"]),
+                                 ("Speakers", devs["speakers"])):
+                if not items:
+                    continue
+                tk.Label(self.devices_frame, text=title, fg=SUBTEXT, bg=BG,
+                         font=(fonts.MEDIUM, -dp(14)), anchor="w"
+                         ).pack(fill="x", pady=(dp(4) if first else dp(14), dp(8)),
+                                padx=dp(2))
+                first = False
+                for d in items:
+                    self._make_card(d)
 
         for name, level in self.ctl.volumes.known_levels.items():
             self._volume_arrived(name, level, from_cache=True)
         self._apply_state(self.ctl.state, self.ctl.state_detail)
-        self._resize()
+        if self._visible:
+            self._resize()
+        self.scroll_canvas.yview_moveto(keep)
 
-    def _make_card(self, parent: tk.Frame, d: dict) -> None:
+    def _make_card(self, d: dict) -> None:
         name = d["name"]
-        cw, pad = self.CARD_W, self.CARD_PAD
-        card = tk.Canvas(parent, width=cw, height=10, bg=BG,
+        dp = self.dp
+        cw, pad = self.card_w, dp(16)
+        card = tk.Canvas(self.devices_frame, width=cw, height=10, bg=BG,
                          highlightthickness=0)
-        card.pack(pady=(0, 8))
+        card.pack(pady=(0, dp(8)))
 
         inner = tk.Frame(card, bg=CARD)
         card.create_window(pad, pad, window=inner, anchor="nw",
@@ -226,42 +358,51 @@ class Popover:
 
         top = tk.Frame(inner, bg=CARD)
         top.pack(fill="x")
-        DeviceIcon(top, kind=d["type"], bg=CARD).pack(side="left",
-                                                      padx=(0, 16))
+        badge = DeviceIcon(top, self.scale, kind=d["type"], bg=CARD)
+        badge.pack(side="left", padx=(0, dp(14)))
+        btn = IconButton(top, self.scale,
+                         on_click=lambda n=name: self._toggle_cast(n), bg=CARD)
+        btn.pack(side="right", padx=(dp(12), 0))
         text_col = tk.Frame(top, bg=CARD)
         text_col.pack(side="left", fill="x", expand=True)
-        tk.Label(text_col, text=name, fg=TEXT, bg=CARD, anchor="w",
-                 font=(SEMIBOLD, -16)).pack(fill="x")
-        kind_line = ("Speaker group" if d["type"] == "group"
-                     else d.get("model") or "Speaker")
+        text_w = cw - 2 * pad - dp(40) - dp(14) - dp(40) - dp(12)
+        tk.Label(text_col, text=ellipsize(name, self._f_name, text_w),
+                 fg=TEXT, bg=CARD, anchor="w", font=self._f_name).pack(fill="x")
+        kind_line = ellipsize(("Speaker group" if d["type"] == "group"
+                               else d.get("model") or "Speaker"),
+                              self._f_sub, text_w)
         sub = tk.Label(text_col, text=kind_line, fg=SUBTEXT, bg=CARD,
-                       anchor="w", font=(FONT, -14))
-        sub.pack(fill="x", pady=(2, 0))
-        btn = IconButton(top, on_click=lambda n=name: self._toggle_cast(n),
-                         bg=CARD)
-        btn.pack(side="right", padx=(12, 0))
+                       anchor="w", font=self._f_sub)
+        sub.pack(fill="x", pady=(dp(3), 0))
 
         bottom = tk.Frame(inner, bg=CARD)
-        bottom.pack(fill="x", pady=(12, 0))
+        bottom.pack(fill="x", pady=(dp(12), 0))
         pct = tk.Label(bottom, text="–", fg=SUBTEXT, bg=CARD, width=4,
-                       anchor="e", font=(FONT, -12))
+                       anchor="e", font=(fonts.FONT, -dp(12)))
         slider = Slider(
-            bottom,
+            bottom, self.scale,
+            width=cw - 2 * pad - dp(44) - dp(8),
             on_change=lambda v, n=name: self._slider_change(n, v),
             on_release=lambda v, n=name: self._slider_release(n, v),
-            bg=CARD, width=cw - 2 * pad - 44)
+            bg=CARD)
         slider.pack(side="left")
         pct.pack(side="right")
 
         inner.update_idletasks()
         ch = inner.winfo_reqheight() + 2 * pad
         card.configure(height=ch)
-        rect = rounded_rect(card, 0, 0, cw, ch, self.CARD_R, fill=CARD,
-                            outline="")
-        card.tag_lower(rect)
+        r = dp(16)
+        bg_ph = render.photo(("cardbg", cw, ch, r, self._ss), cw, ch,
+                             self._ss, BG,
+                             lambda d_, k: d_.rounded_rectangle(
+                                 [0, 0, cw * k, ch * k], radius=r * k,
+                                 fill=CARD))
+        item = card.create_image(0, 0, anchor="nw", image=bg_ph)
+        card._ph = bg_ph
+        card.tag_lower(item)
 
-        self._rows[name] = {"slider": slider, "button": btn, "sub": sub,
-                            "pct": pct, "kind_line": kind_line}
+        self._rows[name] = {"slider": slider, "button": btn, "badge": badge,
+                            "sub": sub, "pct": pct, "kind_line": kind_line}
 
     # ---- casting -----------------------------------------------------------
 
@@ -273,29 +414,6 @@ class Popover:
         else:
             self.ctl.start_cast(name)
 
-    def _show_chip(self, text: str, icon: str, bg: str, fg: str) -> None:
-        c = self.chip
-        c.delete("all")
-        c.configure(bg=BG)
-        pad_x = 16
-        f = (FONT, -14)
-        tmp = c.create_text(0, 0, text=text, font=f, anchor="nw")
-        x1, y1, x2, y2 = c.bbox(tmp)
-        c.delete(tmp)
-        w = (x2 - x1) + pad_x * 2 + 26
-        rounded_rect(c, 0, 0, w, 32, 16, fill=bg, outline="")
-        c.create_text(pad_x, 16, text=ICONS[icon], fill=fg, anchor="w",
-                      font=(ICON_FONT, -18))
-        c.create_text(pad_x + 26, 16, text=text, fill=fg, anchor="w", font=f)
-        if not self.chip_visible:
-            self.chip.pack(fill="x", pady=(0, 4), after=self.status_lbl.master)
-            self.chip_visible = True
-
-    def _hide_chip(self) -> None:
-        if self.chip_visible:
-            self.chip.pack_forget()
-            self.chip_visible = False
-
     def _apply_state(self, state: str, detail: str | None) -> None:
         lag = None
         if state == "PLAYING" and detail and "|" in detail:
@@ -303,37 +421,39 @@ class Popover:
 
         if state == "PLAYING":
             self.status_lbl.configure(text=f"Casting to {detail}")
-            self.header_icon.configure(text=ICONS["cast_connected"], fg=ACCENT)
-            self._show_chip(f"Casting · lag {lag}s" if lag else "Casting",
-                            "cast_connected", CHIP_BG, CHIP_FG)
+            self._set_header_icon("cast_connected", ACCENT)
+            self._hide_banner()
         elif state == "ERROR":
             self.status_lbl.configure(text="Problem")
-            self.header_icon.configure(text=ICONS["cast"], fg=ERROR_FG)
-            self._show_chip(STATE_TEXT["ERROR"].format(d=detail or "error"),
-                            "cast", ERROR_BG, ERROR_FG)
+            self._set_header_icon("cast", ERROR)
+            self._show_banner(str(detail) if detail else "Something went wrong")
         else:
             text = STATE_TEXT.get(state, state).format(d=detail or "")
             self.status_lbl.configure(text=text)
-            self.header_icon.configure(
-                text=ICONS["cast"],
-                fg=SUBTEXT if state in ("IDLE", "DISCOVERING") else WARN)
-            self._hide_chip()
+            self._set_header_icon(
+                "cast", SUBTEXT if state in ("IDLE", "DISCOVERING") else WARN)
+            self._hide_banner()
 
         busy = self.ctl.busy()
         for name, w in self._rows.items():
             is_target = self.ctl.cast_target == name
             w["button"].configure_state("stop" if is_target else "play",
                                         enabled=not busy)
+            w["badge"].set_active(is_target and state == "PLAYING")
             if is_target and state == "PLAYING":
                 w["sub"].configure(text=f"Casting · lag {lag}s" if lag
                                    else "Casting", fg=ACCENT)
             elif w["sub"].cget("fg") == ACCENT:
                 w["sub"].configure(text=w["kind_line"], fg=SUBTEXT)
-        self._resize()
 
-    def _mute_label(self, engaged: bool) -> None:
-        self.mute_lbl.configure(
-            text="PC output muted while casting" if engaged else "")
+        # Structural resize only (state transitions, banner size), never on
+        # PLAYING lag ticks - those only touch the card subtitle text.
+        sig = (state, None if state == "PLAYING" else detail,
+               self._banner_visible)
+        if sig != self._last_sig:
+            self._last_sig = sig
+            if self._visible:
+                self._resize()
 
     # ---- volume ---------------------------------------------------------------
 
@@ -344,6 +464,11 @@ class Popover:
     def _slider_release(self, name: str, value: float) -> None:
         self._rows[name]["pct"].configure(text=f"{value:.0f}%")
         self.ctl.volumes.set_volume_debounced(name, value / 100.0)
+        if self._pending_rebuild and not self._any_dragging():
+            self._pending_rebuild = False
+            self._rebuild_rows()
+            if self._visible:
+                self._resweep()
 
     def _volume_arrived(self, name: str, level: float,
                         from_cache: bool = False) -> None:
@@ -364,6 +489,64 @@ class Popover:
         self.ctl.volumes.open_sweep(
             names, lambda n, lvl: self.post(lambda: self._volume_arrived(n, lvl)))
 
+    # ---- scrolling ------------------------------------------------------------
+
+    def _on_devices_configure(self, _event) -> None:
+        self.scroll_canvas.configure(
+            scrollregion=(0, 0, self.content_w - self.dp(GUTTER),
+                          self.devices_frame.winfo_reqheight()))
+        self._update_thumb()
+
+    def _update_thumb(self) -> None:
+        self.thumb.delete("all")
+        if not self._scrollable:
+            return
+        top, bottom = self.scroll_canvas.yview()
+        h = self.thumb.winfo_height()
+        if h <= 1 or bottom - top >= 1.0:
+            return
+        dp = self.dp
+        th = max(dp(28), round((bottom - top) * h))
+        th -= th % 4                      # quantize: bounded image cache
+        y = min(round(top * h), h - th)
+        w4 = dp(4)
+        ph = render.photo(("thumb", w4, th, self._ss), w4, th, self._ss, BG,
+                          lambda d, k: d.rounded_rectangle(
+                              [0, 0, w4 * k, th * k], radius=w4 * k / 2,
+                              fill=DIVIDER))
+        self.thumb.create_image(0, y, anchor="nw", image=ph)
+        self.thumb._ph = ph
+
+    def _bind_wheel(self) -> None:
+        self._wacc = self._sacc = 0.0
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _on_wheel(self, e):
+        if not self._visible:
+            return None
+        try:
+            w = self.root.winfo_containing(e.x_root, e.y_root)
+        except (KeyError, tk.TclError):
+            w = None
+        if w is None:
+            return None
+        if isinstance(w, Slider):
+            self._wacc += e.delta / 120
+            steps = int(self._wacc)
+            self._wacc -= steps
+            if steps:
+                w.wheel(steps)
+            return "break"
+        if self._scrollable and str(w).startswith(str(self.win)):
+            self._sacc += e.delta / 120
+            steps = int(self._sacc)
+            self._sacc -= steps
+            if steps:
+                self.scroll_canvas.yview_scroll(-steps * 3, "units")
+                self._update_thumb()
+            return "break"
+        return None
+
     # ---- show/hide ------------------------------------------------------------------
 
     def toggle(self) -> None:
@@ -373,21 +556,39 @@ class Popover:
             self.show()
 
     def show(self) -> None:
+        px, py = self.root.winfo_pointerxy()
+        wa, s = _monitor_info_at(px, py)
+        if self._scale_override:
+            s = self._scale_override
+        s = round(s, 2)
+        self._wa = wa
+        self._cancel_fade()
+        if s != self.scale:
+            self._build_static(s)
         self._rebuild_rows()
         self.startup_toggle.set(startup.is_enabled())
-        self._apply_state(self.ctl.state, self.ctl.state_detail)
         self._resweep()
+
+        self.win.attributes("-alpha", 0.0)
         self.win.deiconify()
-        self._resize()
-        self._position()
+        self._apply_dwm()
         self._visible = True
+        self._anchor = None
+        self._resize()
+        x, y = self._final_pos(px, py)
+        self._anchor = (x, y + self._h)
+        self._bind_wheel()
         self.win.after(10, self.win.focus_force)
+        self._animate_in(x, y)
 
     def hide(self) -> None:
         if not self._visible:
             return
         self._visible = False
+        self._cancel_fade()
+        self.root.unbind_all("<MouseWheel>")
         self.win.withdraw()
+        self.win.attributes("-alpha", 1.0)
         self.ctl.volumes.close_all()
 
     def _maybe_close(self, _event) -> None:
@@ -397,29 +598,80 @@ class Popover:
                 self.hide()
         self.win.after(60, check)
 
-    def _resize(self) -> None:
-        self.frame.update_idletasks()
-        w = WIDTH
-        h = self.frame.winfo_reqheight() + 2 * MARGIN
-        self.win.geometry(f"{w}x{h}")
-        self.backdrop.configure(width=w, height=h)
-        self.backdrop.delete("all")
-        rounded_rect(self.backdrop, 0, 0, w, h, RADIUS, fill=BG,
-                     outline=OUTLINE_VAR)
-        self.backdrop.create_window(MARGIN, MARGIN, window=self.frame,
-                                    anchor="nw", width=w - 2 * MARGIN)
+    # ---- chrome / geometry -----------------------------------------------------
 
-    def _position(self) -> None:
+    def _apply_dwm(self) -> None:
+        """Native rounded corners + hairline + flyout shadow. Re-applied on
+        every show: Tk can silently recreate the HWND. No-op pre-Win11."""
+        try:
+            self.win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
+            dwm = ctypes.windll.dwmapi
+            for attr, val in ((33, 2), (34, BORDER_COLORREF)):
+                v = ctypes.c_int(val)
+                dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), attr,
+                                          ctypes.byref(v), 4)
+        except Exception:
+            pass
+
+    def _resize(self) -> None:
+        dp = self.dp
+        self.frame.update_idletasks()
+        dev_h = self.devices_frame.winfo_reqheight()
+        self.scroll_canvas.configure(height=dev_h)
+        self.frame.update_idletasks()
+        total = self.frame.winfo_reqheight() + 2 * dp(14)
+        left, top, right, bottom = self._wa or (0, 0, 1920, 1040)
+        cap = (bottom - top) - dp(24)
+        self._scrollable = total > cap
+        if self._scrollable:
+            self.scroll_canvas.configure(
+                height=max(dp(120), dev_h - (total - cap)))
+            total = cap
+        self._h = total
+        if self._anchor is not None:
+            # Height changed while visible (banner, device list): keep the
+            # bottom edge pinned so growth never pushes past the work area.
+            ax, abot = self._anchor
+            y = max(top + dp(8), min(abot, bottom - dp(8)) - total)
+            self.win.geometry(f"{self.win_w}x{total}+{ax}+{y}")
+        else:
+            self.win.geometry(f"{self.win_w}x{total}")
         self.win.update_idletasks()
-        px, py = self.root.winfo_pointerxy()
-        w = self.win.winfo_width() or WIDTH
-        h = self.win.winfo_height()
-        left, top, right, bottom = _work_area_at(px, py)
-        x = min(max(px - w // 2, left + 8), right - w - 8)
-        y = py - h - 14
-        if y < top + 8:
-            y = min(py + 14, bottom - h - 8)
-        self.win.geometry(f"+{x}+{y}")
+        self._update_thumb()
+
+    def _final_pos(self, px: int, py: int) -> tuple[int, int]:
+        dp = self.dp
+        left, top, right, bottom = self._wa
+        w, h = self.win_w, self._h
+        x = min(max(px - w // 2, left + dp(8)), right - w - dp(8))
+        y = py - h - dp(12)
+        if y < top + dp(8):
+            y = min(py + dp(12), bottom - h - dp(8))
+        return x, max(top + dp(8), y)
+
+    def _animate_in(self, x: int, y: int) -> None:
+        seq = ((0.25, 10), (0.55, 6), (0.8, 3), (0.95, 1), (1.0, 0))
+
+        def step(i: int) -> None:
+            self._fade_after = None
+            if not self._visible:
+                return
+            alpha, off = seq[i]
+            self.win.attributes("-alpha", alpha)
+            self.win.geometry(f"+{x}+{y + self.dp(off)}")
+            if i + 1 < len(seq):
+                self._fade_after = self.win.after(24, lambda: step(i + 1))
+
+        step(0)
+
+    def _cancel_fade(self) -> None:
+        if self._fade_after is not None:
+            try:
+                self.win.after_cancel(self._fade_after)
+            except Exception:
+                pass
+            self._fade_after = None
 
     # ---- startup / exit ------------------------------------------------------------------
 
