@@ -230,15 +230,47 @@ class VolumeManager:
         def fire():
             self.last_write[name] = time.monotonic()
             try:
-                sc = self._get_cast(name)
-                safety.set_volume(sc.unwrap_for_safety_module_only(), level,
-                                  self._ctl.cfg, self._ctl.discovery.devices)
+                info = self._ctl.discovery.find(name)
+                if info is not None and info.cast_type == "group":
+                    self._set_group_flat(name, level)
+                else:
+                    sc = self._get_cast(name)
+                    safety.set_volume(sc.unwrap_for_safety_module_only(), level,
+                                      self._ctl.cfg, self._ctl.discovery.devices)
             except Exception as e:
                 log.warning("volume set %r failed: %s", name, e)
         timer = threading.Timer(0.25, fire)
         timer.daemon = True
         self._debounce[name] = timer
         timer.start()
+
+    def _set_group_flat(self, group_name: str, level: float) -> None:
+        """Group slider semantics (user spec): every member speaker is set to
+        the ABSOLUTE level - 0 is silence, 100 is that speaker's max. Google's
+        native group volume rescales members proportionally from their prior
+        levels, which reads as 'group at 100% yet speakers quiet' whenever
+        members sit low."""
+        sc = self._get_cast(group_name)
+        members = safety.resolve_group_members(sc.unwrap_for_safety_module_only())
+        known = self._ctl.discovery.devices
+        names = [known[u] for u in (members or []) if u in known]
+        if not names:
+            # Membership unresolved - fall back to Google's proportional set
+            # so the slider still does something.
+            log.warning("group %r members unresolved; proportional fallback",
+                        group_name)
+            safety.set_volume(sc.unwrap_for_safety_module_only(), level,
+                              self._ctl.cfg, known)
+            return
+        log.info("group %r flatten: %s -> %.2f", group_name, names, level)
+        for member in names:
+            self.last_write[member] = time.monotonic()
+            try:
+                msc = self._get_cast(member)
+                safety.set_volume(msc.unwrap_for_safety_module_only(), level,
+                                  self._ctl.cfg, known)
+            except Exception as e:
+                log.warning("member volume %r failed: %s", member, e)
 
     def close_all(self) -> None:
         with self._lock:
