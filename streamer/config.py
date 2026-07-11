@@ -36,9 +36,24 @@ def load() -> dict:
     return cfg
 
 
+# Keys the app itself mutates at runtime. save() persists ONLY these -
+# policy keys (max_volume, office_names, ...) edited on disk must never be
+# clobbered by a running instance's stale in-memory copy.
+APP_OWNED_KEYS = ("last_device", "stream_type")
+
+
 def save(cfg: dict) -> None:
     path = config_dir() / "config.json"
-    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    on_disk = {}
+    if path.exists():
+        try:
+            on_disk = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    merged = dict(DEFAULTS)
+    merged.update(on_disk)
+    merged.update({k: cfg[k] for k in APP_OWNED_KEYS if k in cfg})
+    path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 
 def setup_logging(verbose: bool = False) -> None:

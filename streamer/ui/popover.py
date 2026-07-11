@@ -265,7 +265,7 @@ class Popover:
     def _drag_end(self, name: str) -> None:
         self._dragging = None
         w = self._rows.get(name)
-        if w:
+        if w and "disabled" not in w["scale"].state():
             self.ctl.volumes.set_volume_debounced(name, w["var"].get() / 100.0)
 
     def _on_slider(self, name: str, value: float) -> None:
@@ -273,8 +273,8 @@ class Popover:
         if w is None:
             return
         w["pct"].configure(text=f"{value:3.0f}%")
-        if self._updating_ui:
-            return  # programmatic set (arriving reading) - not a user action
+        if self._updating_ui or "disabled" in w["scale"].state():
+            return  # programmatic set or not-yet-initialised slider
         self.ctl.volumes.set_volume_debounced(name, value / 100.0)
 
     def _volume_arrived(self, name: str, level: float) -> None:
