@@ -1,50 +1,81 @@
-"""Custom-drawn tkinter widgets in a Google Home-like dark idiom.
+"""Material 3 dark widgets (Google Home idiom), Canvas-drawn.
 
-Everything is Canvas-based: rounded cards, a thin slider with a round thumb
-and filled track, circular icon buttons, a pill toggle. Colors follow the
-Material dark palette Google Home uses.
+Palette and metrics follow the GM3 dark ramp as observed in Google Home /
+Android 14: 16px twin-track slider with a 4x44 bar handle, filled/tonal 40px
+icon buttons, 52x32 switch, Material Icons Round glyphs. Font sizes are
+negative (= exact pixels) throughout.
 """
 from __future__ import annotations
 
 import tkinter as tk
 from typing import Callable
 
-# Material-dark palette (Google Home-ish)
-BG = "#1f1f23"          # window background
-CARD = "#2b2b30"        # card background
-CARD_HOVER = "#33333a"
-TEXT = "#e8eaed"
-SUBTEXT = "#9aa0a6"
-ACCENT = "#8ab4f8"      # material dark blue
-ACCENT_DIM = "#5f84c4"
-TRACK = "#4a4a52"
-GOOD = "#81c995"
-WARN = "#fdd663"
-ERROR = "#f28b82"
-STOP_RED = "#f28b82"
+from .fonts import ICON_FONT, ICONS, ensure_fonts
+
+# --- GM3 dark color roles ---------------------------------------------------
+BG = "#131314"            # surface
+CARD = "#1E1F20"          # surface-container
+CARD_HOVER = "#2E2F30"    # +8% on-surface
+BADGE = "#333537"         # surface-container-highest
+TEXT = "#E3E3E3"          # on-surface
+SUBTEXT = "#C4C7C5"       # on-surface-variant
+OUTLINE = "#8E918F"
+OUTLINE_VAR = "#444746"
+ACCENT = "#A8C7FA"        # primary
+ON_ACCENT = "#062E6F"     # on-primary
+TONAL = "#3E4759"         # secondary-container
+ON_TONAL = "#DAE2F9"      # on-secondary-container
+CHIP_BG = "#0842A0"       # primary-container
+CHIP_FG = "#D3E3FD"       # on-primary-container
+TRACK = TONAL             # slider inactive track
+STOP_DOT = ON_TONAL
+GOOD = "#6DD58C"
+WARN = "#FDD663"
+ERROR = "#F2B8B5"
+ERROR_BG = "#8C1D18"
+ERROR_FG = "#F9DEDC"
+DISABLED_FILL = "#363738"
+DISABLED_GLYPH = "#6A6B6C"
 
 FONT = "Segoe UI"
+SEMIBOLD = "Segoe UI Semibold"
+
+ensure_fonts()
+
+
+def icon_text(canvas: tk.Canvas, x, y, name: str, px: int, fill: str,
+              anchor="center") -> int:
+    return canvas.create_text(x, y, text=ICONS[name], fill=fill, anchor=anchor,
+                              font=(ICON_FONT, -px))
 
 
 def rounded_rect(canvas: tk.Canvas, x1, y1, x2, y2, r, **kw) -> int:
-    """Draw a rounded rectangle; returns the polygon id."""
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
-class Slider(tk.Canvas):
-    """Thin-track slider with round thumb. Value 0..100.
+def asym_rrect(canvas: tk.Canvas, x1, y1, x2, y2, rl, rr, **kw) -> int:
+    """Rounded rect with different left/right radii (M3 slider tracks)."""
+    pts = [x1 + rl, y1, x2 - rr, y1, x2, y1, x2, y1 + rr, x2, y2 - rr, x2, y2,
+           x2 - rr, y2, x1 + rl, y2, x1, y2, x1, y2 - rl, x1, y1 + rl, x1, y1]
+    return canvas.create_polygon(pts, smooth=True, **kw)
 
-    on_change(value) fires during drag (the consumer debounces);
-    on_release(value) fires at drag end. set_value() never fires callbacks.
-    An 'unknown' state (no reading yet) renders a dim track with no thumb.
+
+class Slider(tk.Canvas):
+    """M3 (Android 14) slider: 16px active/inactive tracks with asymmetric
+    corner radii, 6px gaps around a 4x44 vertical bar handle, 4px stop dot.
+
+    Value 0..100. on_change fires during drag (consumer debounces);
+    on_release at drag end. set_value() never fires callbacks. Unknown state
+    (value None): inactive track only.
     """
 
-    H = 28
-    PAD = 10
-    TRACK_W = 3
-    THUMB_R = 7
+    H = 44
+    TRACK_H = 16
+    HANDLE_W, HANDLE_H, HANDLE_R = 4, 44, 2
+    GAP = 6
+    R_OUT, R_IN = 8, 2
 
     def __init__(self, parent, on_change: Callable[[float], None],
                  on_release: Callable[[float], None], bg=CARD, width=220):
@@ -53,40 +84,49 @@ class Slider(tk.Canvas):
                          highlightthickness=0, cursor="hand2")
         self._on_change = on_change
         self._on_release = on_release
-        self.value: float | None = None   # None = unknown
+        self.value: float | None = None
         self.dragging = False
-        self._bg = bg
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._drag)
         self.bind("<ButtonRelease-1>", self._release)
         self._draw()
 
-    # geometry helpers
     def _x_for(self, value: float) -> float:
-        usable = self.W - 2 * self.PAD
-        return self.PAD + usable * (value / 100.0)
+        usable = self.W - self.HANDLE_W
+        return self.HANDLE_W / 2 + usable * (value / 100.0)
 
     def _value_for(self, x: float) -> float:
-        usable = self.W - 2 * self.PAD
-        return min(100.0, max(0.0, (x - self.PAD) / usable * 100.0))
+        usable = self.W - self.HANDLE_W
+        return min(100.0, max(0.0, (x - self.HANDLE_W / 2) / usable * 100.0))
 
     def _draw(self) -> None:
         self.delete("all")
         cy = self.H / 2
+        ty1, ty2 = cy - self.TRACK_H / 2, cy + self.TRACK_H / 2
+
         if self.value is None:
-            self.create_line(self.PAD, cy, self.W - self.PAD, cy,
-                             fill=TRACK, width=self.TRACK_W, capstyle="round")
-            self.create_text(self.W / 2, cy, text="…", fill=SUBTEXT,
-                             font=(FONT, 7))
+            asym_rrect(self, 0, ty1, self.W, ty2, self.R_OUT, self.R_OUT,
+                       fill=TRACK, outline="")
             return
+
         x = self._x_for(self.value)
-        self.create_line(self.PAD, cy, self.W - self.PAD, cy,
-                         fill=TRACK, width=self.TRACK_W, capstyle="round")
-        if x > self.PAD:
-            self.create_line(self.PAD, cy, x, cy, fill=ACCENT,
-                             width=self.TRACK_W, capstyle="round")
-        r = self.THUMB_R + (2 if self.dragging else 0)
-        self.create_oval(x - r, cy - r, x + r, cy + r, fill=ACCENT, outline="")
+        hw = (2 if self.dragging else self.HANDLE_W)
+        left_end = x - hw / 2 - self.GAP
+        right_start = x + hw / 2 + self.GAP
+
+        if left_end > self.R_OUT:
+            asym_rrect(self, 0, ty1, left_end, ty2, self.R_OUT, self.R_IN,
+                       fill=ACCENT, outline="")
+        if right_start < self.W - self.R_OUT:
+            asym_rrect(self, right_start, ty1, self.W, ty2, self.R_IN,
+                       self.R_OUT, fill=TRACK, outline="")
+            if self.value < 96:
+                self.create_oval(self.W - 8 - 2, cy - 2, self.W - 8 + 2,
+                                 cy + 2, fill=STOP_DOT, outline="")
+
+        rounded_rect(self, x - hw / 2, cy - self.HANDLE_H / 2,
+                     x + hw / 2, cy + self.HANDLE_H / 2, self.HANDLE_R,
+                     fill=ACCENT, outline="")
 
     def set_value(self, value: float | None) -> None:
         self.value = None if value is None else min(100.0, max(0.0, value))
@@ -116,19 +156,25 @@ class Slider(tk.Canvas):
 
 
 class IconButton(tk.Canvas):
-    """Circular icon button: play / stop glyphs, accent when active."""
+    """M3 icon button, 40px. play = filled tonal; stop = filled primary
+    (Google Home's active-cast affordance - not red)."""
 
-    D = 34
+    D = 40
 
     def __init__(self, parent, on_click: Callable[[], None], bg=CARD):
         super().__init__(parent, width=self.D, height=self.D, bg=bg,
                          highlightthickness=0, cursor="hand2")
         self._on_click = on_click
-        self.mode = "play"        # play | stop
+        self.mode = "play"
         self.enabled = True
+        self._hover = False
         self.bind("<ButtonRelease-1>", lambda e: self._click())
-        self.bind("<Enter>", lambda e: self._draw(hover=True))
-        self.bind("<Leave>", lambda e: self._draw())
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self._draw()
+
+    def _set_hover(self, on: bool) -> None:
+        self._hover = on
         self._draw()
 
     def _click(self) -> None:
@@ -139,30 +185,24 @@ class IconButton(tk.Canvas):
         self.mode, self.enabled = mode, enabled
         self._draw()
 
-    def _draw(self, hover: bool = False) -> None:
+    def _draw(self) -> None:
         self.delete("all")
-        d, pad = self.D, 2
-        if self.mode == "stop":
-            ring = STOP_RED
+        d = self.D
+        if not self.enabled:
+            fill, glyph_color = DISABLED_FILL, DISABLED_GLYPH
+        elif self.mode == "stop":
+            fill, glyph_color = ACCENT, ON_ACCENT
         else:
-            ring = ACCENT if self.enabled else TRACK
-        fill = ring if (hover and self.enabled) else ""
-        glyph = TEXT if fill else ring
-        self.create_oval(pad, pad, d - pad, d - pad, outline=ring, width=2,
-                         fill=fill)
-        c = d / 2
-        if self.mode == "play":
-            self.create_polygon(c - 4, c - 6, c - 4, c + 6, c + 7, c,
-                                fill=glyph, outline="")
-        else:
-            self.create_rectangle(c - 5, c - 5, c + 5, c + 5, fill=glyph,
-                                  outline="")
+            fill, glyph_color = ("#485163" if self._hover else TONAL), ON_TONAL
+        self.create_oval(0, 0, d, d, fill=fill, outline="")
+        icon_text(self, d / 2, d / 2, "stop" if self.mode == "stop" else "play",
+                  24, glyph_color)
 
 
 class Toggle(tk.Canvas):
-    """Small pill toggle (Start with Windows)."""
+    """M3 switch: 52x32 track, 16px off-handle / 24px on-handle."""
 
-    W, H = 36, 20
+    W, H = 52, 32
 
     def __init__(self, parent, on_change: Callable[[bool], None], bg=BG):
         super().__init__(parent, width=self.W, height=self.H, bg=bg,
@@ -184,36 +224,30 @@ class Toggle(tk.Canvas):
     def _draw(self) -> None:
         self.delete("all")
         w, h = self.W, self.H
-        col = ACCENT if self.on else TRACK
-        rounded_rect(self, 1, 3, w - 1, h - 3, (h - 6) / 2, fill=col, outline="")
-        x = w - h / 2 - 1 if self.on else h / 2 + 1
-        r = h / 2 - 2
-        self.create_oval(x - r, h / 2 - r, x + r, h / 2 + r,
-                         fill=TEXT, outline="")
+        if self.on:
+            rounded_rect(self, 0, 0, w, h, h / 2, fill=ACCENT, outline="")
+            cx, r = w - 16, 12
+            self.create_oval(cx - r, h / 2 - r, cx + r, h / 2 + r,
+                             fill=ON_ACCENT, outline="")
+            icon_text(self, cx, h / 2, "check", 14, ACCENT)
+        else:
+            rounded_rect(self, 1, 1, w - 1, h - 1, (h - 2) / 2, fill=BADGE,
+                         outline=OUTLINE, width=2)
+            cx, r = 16, 8
+            self.create_oval(cx - r, h / 2 - r, cx + r, h / 2 + r,
+                             fill=OUTLINE, outline="")
 
 
 class DeviceIcon(tk.Canvas):
-    """Circular badge with a speaker / group glyph."""
+    """40px badge circle with a Material glyph for the device kind."""
 
-    D = 34
+    D = 40
 
-    def __init__(self, parent, kind: str, bg=CARD):
+    def __init__(self, parent, kind: str, bg=CARD, active: bool = False):
         super().__init__(parent, width=self.D, height=self.D, bg=bg,
                          highlightthickness=0)
         d = self.D
-        self.create_oval(2, 2, d - 2, d - 2, fill="#3a3a41", outline="")
-        c = d / 2
-        if kind == "group":
-            # three small speakers
-            for dx in (-7, 0, 7):
-                self.create_rectangle(c + dx - 2.4, c - 5, c + dx + 2.4, c + 5,
-                                      outline=SUBTEXT, width=1.2)
-                self.create_oval(c + dx - 1.4, c + 0.6, c + dx + 1.4, c + 3.4,
-                                 outline=SUBTEXT, width=1)
-        else:
-            self.create_rectangle(c - 5, c - 8, c + 5, c + 8, outline=SUBTEXT,
-                                  width=1.4)
-            self.create_oval(c - 2.6, c - 5.4, c + 2.6, c - 0.2,
-                             outline=SUBTEXT, width=1.2)
-            self.create_oval(c - 3.4, c + 0.6, c + 3.4, c + 7,
-                             outline=SUBTEXT, width=1.2)
+        self.create_oval(0, 0, d, d, fill=BADGE, outline="")
+        glyph = {"group": "speaker_group", "cast": "tv"}.get(kind, "speaker")
+        icon_text(self, d / 2, d / 2, glyph, 24,
+                  ACCENT if active else SUBTEXT)
