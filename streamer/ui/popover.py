@@ -52,6 +52,16 @@ STATE_TEXT = {
 }
 
 
+def _set_app_id() -> None:
+    """Give Windows a stable app identity so the taskbar/Alt-Tab entry groups
+    and labels as this app (not 'python'), and uses our icon - not pythonw's."""
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Turrabo.DesktopAudioStreamer")
+    except Exception:
+        pass
+
+
 def _dpi_aware() -> str:
     user32 = ctypes.windll.user32
     try:
@@ -106,6 +116,7 @@ def _monitor_info_at(x: int, y: int) -> tuple[tuple[int, int, int, int], float]:
 
 class Popover:
     def __init__(self, ctl, on_exit):
+        _set_app_id()
         log.debug("dpi awareness: %s", _dpi_aware())
         fonts.ensure_fonts()
         self.ctl = ctl
@@ -115,6 +126,12 @@ class Popover:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("Desktop Audio Streamer")
+        try:
+            # default= sets the process-wide window icon (all toplevels +
+            # Alt-Tab), replacing pythonw's Python feather.
+            self.root.iconbitmap(default=str(fonts.APP_ICO))
+        except tk.TclError as e:
+            log.debug("iconbitmap failed: %s", e)
 
         self.win = tk.Toplevel(self.root)
         self.win.withdraw()
@@ -124,6 +141,7 @@ class Popover:
 
         self._rows: dict[str, dict] = {}
         self._visible = False
+        self._pending_target: str | None = None   # device the user is starting
         self._fade_after: str | None = None
         self._pending_rebuild = False
         self._last_sig = None
@@ -195,18 +213,23 @@ class Popover:
         self._ss = render.supersample(scale)
         self._f_name = tkfont.Font(family=fonts.MEDIUM, size=-dp(16))
         self._f_sub = tkfont.Font(family=fonts.FONT, size=-dp(14))
+        self._f_status = tkfont.Font(family=fonts.MEDIUM, size=-dp(16))
 
         f = self.frame = tk.Frame(self.win, bg=BG)
         f.pack(fill="both", expand=True, padx=dp(MARGIN),
                pady=(dp(14), dp(14)))
 
-        self.header = tk.Frame(f, bg=BG)
+        # Fixed-height header: reserve two lines so status text flipping
+        # through transitional states never reflows the cards below it.
+        header_h = max(dp(28), 2 * self._f_status.metrics("linespace") + dp(2))
+        self.header = tk.Frame(f, bg=BG, height=header_h)
         self.header.pack(fill="x", pady=(0, dp(6)))
+        self.header.pack_propagate(False)
         self.header_icon = tk.Label(self.header, bg=BG)
         self.header_icon.pack(side="left", padx=(dp(2), dp(12)))
         self.status_lbl = tk.Label(
             self.header, text="Not casting", fg=TEXT, bg=BG, anchor="w",
-            justify="left", font=(fonts.MEDIUM, -dp(16)),
+            justify="left", font=self._f_status,
             wraplength=self.content_w - dp(44))
         self.status_lbl.pack(side="left", fill="x", expand=True)
         self._set_header_icon("cast", SUBTEXT)
@@ -412,6 +435,7 @@ class Popover:
         if self.ctl.cast_target == name:
             self.ctl.stop_cast()
         else:
+            self._pending_target = name    # spin this card until it plays
             self.ctl.start_cast(name)
 
     def _apply_state(self, state: str, detail: str | None) -> None:
@@ -435,10 +459,18 @@ class Popover:
             self._hide_banner()
 
         busy = self.ctl.busy()
+        if state in ("IDLE", "PLAYING", "ERROR"):
+            self._pending_target = None
+        # The device warming up (or being torn down): cast_target once the
+        # session exists, else the card the user just tapped.
+        warming = (self.ctl.cast_target or self._pending_target) if busy else None
         for name, w in self._rows.items():
             is_target = self.ctl.cast_target == name
-            w["button"].configure_state("stop" if is_target else "play",
-                                        enabled=not busy)
+            if busy and name == warming:
+                w["button"].configure_state("busy", enabled=False)
+            else:
+                w["button"].configure_state("stop" if is_target else "play",
+                                            enabled=not busy)
             w["badge"].set_active(is_target and state == "PLAYING")
             if is_target and state == "PLAYING":
                 w["sub"].configure(text=f"Casting · lag {lag}s" if lag

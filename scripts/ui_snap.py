@@ -103,6 +103,16 @@ def scenario():
     pop.root.after(700, bench_slider)
     pop.root.after(900, lambda: grab("idle"))
 
+    def warming_state():
+        # Cast warming up: cast_target not yet set, pending target spins.
+        ctl.state, ctl.state_detail = "LAUNCHING", "Everywhere"
+        ctl.cast_target = None
+        pop._pending_target = "Everywhere"
+        pop._apply_state("LAUNCHING", "Everywhere")
+
+    pop.root.after(1000, warming_state)
+    pop.root.after(1300, lambda: grab("warming"))
+
     def casting_state():
         ctl.state, ctl.state_detail = "PLAYING", "Everywhere|1.1"
         ctl.cast_target = "Everywhere"
@@ -116,11 +126,11 @@ def scenario():
         ctl.cast_target = None
         pop._apply_state("ERROR", ctl.state_detail)
 
-    pop.root.after(1100, casting_state)
-    pop.root.after(1500, lambda: grab("casting"))
-    pop.root.after(1700, error_state)
-    pop.root.after(2100, lambda: grab("error"))
-    pop.root.after(2400, pop.root.destroy)
+    pop.root.after(1500, casting_state)
+    pop.root.after(1900, lambda: grab("casting"))
+    pop.root.after(2100, error_state)
+    pop.root.after(2500, lambda: grab("error"))
+    pop.root.after(2800, pop.root.destroy)
 
 
 pop.root.after(300, scenario)

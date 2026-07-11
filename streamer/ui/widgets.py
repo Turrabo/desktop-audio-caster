@@ -25,6 +25,7 @@ BADGE = "#333537"         # surface-container-highest
 TEXT = "#E3E3E3"          # on-surface
 SUBTEXT = "#C4C7C5"       # on-surface-variant
 OUTLINE = "#8E918F"
+OUTLINE_VAR = "#444746"   # spinner track
 DIVIDER = "#2F3133"       # hairline on surface
 ACCENT = "#A8C7FA"        # primary
 ON_ACCENT = "#062E6F"     # on-primary
@@ -192,11 +193,16 @@ class Slider(tk.Canvas):
 
 class IconButton(tk.Canvas):
     """M3 icon button, 40dp. play = filled tonal; stop = filled primary
-    (Google Home's active-cast affordance - not red)."""
+    (Google Home's active-cast affordance - not red); busy = an animated
+    indeterminate spinner shown while the cast warms up / buffers."""
+
+    SPIN_N = 12          # spinner frames (30 deg apart)
+    SPIN_MS = 80         # ~1 rev/sec
 
     def __init__(self, parent, scale: float, on_click: Callable[[], None],
                  bg=CARD):
         dp = lambda v: round(v * scale)
+        self._dp = dp
         self.D = dp(40)
         self._glyph_px = dp(24)
         super().__init__(parent, width=self.D, height=self.D, bg=bg,
@@ -207,14 +213,19 @@ class IconButton(tk.Canvas):
         self.mode = "play"
         self.enabled = True
         self._hover = False
+        self._spin_frame = 0
+        self._spin_after: str | None = None
         self._item = self.create_image(0, 0, anchor="nw")
         self._photo = None
         self.bind("<ButtonRelease-1>", lambda e: self._click())
         self.bind("<Enter>", lambda e: self._set_hover(True))
         self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<Destroy>", lambda e: self._stop_spin())
         self._draw()
 
     def _set_hover(self, on: bool) -> None:
+        if self.mode == "busy":
+            return
         self._hover = on
         self._draw()
 
@@ -223,8 +234,48 @@ class IconButton(tk.Canvas):
             self._on_click()
 
     def configure_state(self, mode: str, enabled: bool) -> None:
+        if mode == "busy":
+            self.mode, self.enabled = "busy", False
+            self.configure(cursor="")
+            if self._spin_after is None:
+                self._spin()
+            return
+        self._stop_spin()
+        self.configure(cursor="hand2")
         self.mode, self.enabled = mode, enabled
         self._draw()
+
+    def _stop_spin(self) -> None:
+        if self._spin_after is not None:
+            try:
+                self.after_cancel(self._spin_after)
+            except Exception:
+                pass
+            self._spin_after = None
+
+    def _spin(self) -> None:
+        if not self.winfo_exists():
+            self._spin_after = None
+            return
+        self._draw_spinner(self._spin_frame)
+        self._spin_frame = (self._spin_frame + 1) % self.SPIN_N
+        self._spin_after = self.after(self.SPIN_MS, self._spin)
+
+    def _draw_spinner(self, frame: int) -> None:
+        D, dp = self.D, self._dp
+        inset = dp(11)
+        lw = max(dp(3), 2)
+        start = frame * (360 / self.SPIN_N)
+        key = ("spin", frame, D, self._bg, self._ss)
+
+        def paint(d, k):
+            d.ellipse([0, 0, D * k, D * k], fill=TONAL)
+            box = [inset * k, inset * k, (D - inset) * k, (D - inset) * k]
+            d.arc(box, 0, 360, fill=OUTLINE_VAR, width=round(lw * k))
+            d.arc(box, start, start + 260, fill=ACCENT, width=round(lw * k))
+
+        self._photo = render.photo(key, D, D, self._ss, self._bg, paint)
+        self.itemconfigure(self._item, image=self._photo)
 
     def _draw(self) -> None:
         if not self.enabled:
