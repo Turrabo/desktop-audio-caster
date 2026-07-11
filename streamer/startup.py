@@ -20,6 +20,10 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def _command() -> str:
+    # Frozen: the exe relaunches itself (windowed, so silent at login).
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    # From source: windowless pythonw running the shim.
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     shim = REPO / "launch_tray.pyw"
     return f'"{pythonw}" "{shim}"'

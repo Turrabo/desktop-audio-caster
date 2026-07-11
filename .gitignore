@@ -1,5 +1,8 @@
 .venv/
+.build-venv/
 __pycache__/
 *.pyc
+build/
+dist/
 soak_out.txt
 pipeline_out.txt

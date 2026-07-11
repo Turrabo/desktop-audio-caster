@@ -10,14 +10,25 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-ASSETS = Path(__file__).resolve().parents[2] / "assets"
+
+def _assets_dir() -> Path:
+    """assets/ next to the sources in dev, or unpacked beside the frozen exe
+    (PyInstaller sets sys._MEIPASS to the bundle root in both build modes)."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets"
+    return Path(__file__).resolve().parents[2] / "assets"
+
+
+ASSETS = _assets_dir()
 FR_PRIVATE = 0x10
 
 ICON_FONT_PATH = ASSETS / "MaterialIconsRound-Regular.otf"
+APP_ICO = ASSETS / "app.ico"
 
 # UI families, resolved by ensure_fonts(); Segoe fallbacks until then.
 FONT = "Segoe UI"
