@@ -10,7 +10,7 @@ unreliable (flaky connects, latency drifting to 10 s). Design + rationale:
 ## Install
 
 1. Download **DesktopAudioStreamer.exe** from the
-   [latest release](https://github.com/Turrabo/desktop-audio-streamer/releases/latest).
+   [latest release](https://github.com/Turrabo/desktop-audio-caster/releases/latest).
 2. Run it. A cast icon appears in the system tray (near the clock). No Python
    or setup needed.
 
@@ -58,8 +58,8 @@ other module gains a volume call.
 Requires Python 3.11+ on Windows (3.13 recommended for packaging).
 
 ```
-git clone https://github.com/Turrabo/desktop-audio-streamer
-cd desktop-audio-streamer
+git clone https://github.com/Turrabo/desktop-audio-caster
+cd desktop-audio-caster
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\pythonw launch_tray.pyw        # run from source
