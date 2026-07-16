@@ -18,7 +18,7 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 from . import config as cfg_mod
-from . import startup
+from . import firewall, startup
 from .appctl import AppController, TRANSITIONAL_STATES
 from .ui.fonts import ASSETS, ICONS
 from .ui.popover import Popover
@@ -143,6 +143,9 @@ class TrayApp:
             log.info("another instance is running - asked it to show; exiting")
             return 0
         startup.repair_if_stale()
+        threading.Thread(
+            target=lambda: firewall.ensure_allowed(self.ctl.cfg, cfg_mod.save),
+            name="fw-register", daemon=True).start()
         self.icon.run_detached()          # pystray gets its own thread
         self.popover.run()                # tkinter owns the main thread
         return 0

@@ -60,11 +60,14 @@ pychromecast: resident CastBrowser discovery, connect, play_media(url), status, 
    row). Explicitly covered: sleep/resume (capture invalidated + IP re-check on resume), DHCP/IP
    change (URL re-derived per re-cast), speaker reboot (browser re-resolves), group leader
    migration (browser re-resolves), firewall (below).
-6. **Firewall/NIC**: setup adds an inbound allow rule for the venv's python.exe (netsh, elevated —
-   UAC is off on this machine). Source IP for the URL is derived by opening a UDP socket toward
-   the speaker's IP and reading the local address (route-based, correct across multiple NICs/VPNs).
-   Pre-cast self-check: after `play_media`, if zero GETs arrive within 10 s → report "firewall or
-   routing" explicitly instead of generic failure.
+6. **Firewall/NIC**: frozen builds self-register an all-profiles, localsubnet-scoped inbound
+   allow rule for the exe at startup (streamer/firewall.py; silent when elevated, one UAC
+   attempt otherwise) — Windows scopes its first-run prompt to the active network profile, and
+   a later Private/Public flip silently kills casting otherwise. Source IP for the URL is
+   derived by opening a UDP socket toward the speaker's IP and reading the local address
+   (route-based, correct across multiple NICs/VPNs). Self-check: if no stream GET ever arrives,
+   the watchdog re-casts a bounded number of times then stops with an explicit firewall error
+   (and tears down / unmutes) instead of retrying forever.
 7. **Silent machine**: probe muted-endpoint loopback empirically (behaviour varies by driver).
    Pass → localmute.py path. Fail → VB-Cable as the supported silent path (documented install,
    endpoint volume pinned 100%, app captures the cable). Decision recorded in README; the probe

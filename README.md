@@ -15,8 +15,16 @@ unreliable (flaky connects, latency drifting to 10 s). Design + rationale:
    or setup needed.
 
 Windows SmartScreen may warn on first run because the exe is unsigned — choose
-**More info → Run anyway**. Casting needs the speakers on the same LAN, and the
-first cast prompts Windows Firewall to allow the app (say yes).
+**More info → Run anyway**. Casting needs the speakers on the same LAN.
+
+On first launch the app asks for administrator approval once (a Windows
+`netsh` prompt) to register its firewall rule. Speakers fetch the audio over
+the network, and Windows scopes its own firewall prompt to whichever network
+profile happens to be active — flip between Private and Public later and
+casting silently breaks. The app's rule covers every profile but only accepts
+connections from your local subnet. If you decline the approval, allow the
+app for **both** private and public networks when Windows asks on the first
+cast; otherwise casting stops with a firewall error explaining the fix.
 
 ## Use
 
