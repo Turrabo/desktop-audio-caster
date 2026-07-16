@@ -140,9 +140,11 @@ class Popover:
         self.win.configure(bg=BG)
 
         self._rows: dict[str, dict] = {}
+        self._dev_sig: tuple | None = None
         self._visible = False
         self._pending_target: str | None = None   # device the user is starting
         self._fade_after: str | None = None
+        self._resweep_after: str | None = None
         self._pending_rebuild = False
         self._last_sig = None
         self._wa = None
@@ -320,13 +322,29 @@ class Popover:
         elif not engaged and self._mute_packed:
             self.mute_lbl.pack_forget()
             self._mute_packed = False
+        else:
+            return
+        if self._visible:
+            self._resize()
 
     # ---- device cards ------------------------------------------------------
 
     def _any_dragging(self) -> bool:
         return any(r["slider"].dragging for r in self._rows.values())
 
+    def _devices_sig(self) -> tuple:
+        devs = self.ctl.devices()
+        return tuple((d["name"], d["type"], d.get("model"))
+                     for sec in ("groups", "speakers") for d in devs[sec])
+
     def _devices_changed(self) -> None:
+        # zeroconf fires add/update/remove constantly (TXT record churn,
+        # notably DURING cast warm-up); rebuilding cards for those makes the
+        # whole popover flicker. Only rebuild when the visible device list
+        # actually changed (the empty list is a valid, stable state too).
+        sig = self._devices_sig()
+        if sig == self._dev_sig and (self._rows or not sig):
+            return
         if self._any_dragging():
             self._pending_rebuild = True
             return
@@ -335,6 +353,7 @@ class Popover:
             self._resweep()
 
     def _rebuild_rows(self) -> None:
+        self._dev_sig = self._devices_sig()
         keep = self.scroll_canvas.yview()[0]
         for child in self.devices_frame.winfo_children():
             child.destroy()
@@ -478,10 +497,11 @@ class Popover:
             elif w["sub"].cget("fg") == ACCENT:
                 w["sub"].configure(text=w["kind_line"], fg=SUBTEXT)
 
-        # Structural resize only (state transitions, banner size), never on
-        # PLAYING lag ticks - those only touch the card subtitle text.
-        sig = (state, None if state == "PLAYING" else detail,
-               self._banner_visible)
+        # Resize only when window geometry actually changes: the banner
+        # appearing/disappearing/rewording. The header is fixed-height, so
+        # ordinary state flips (connecting -> launching -> casting) and
+        # PLAYING lag ticks must not touch the layout at all.
+        sig = (self._banner_visible, detail if state == "ERROR" else None)
         if sig != self._last_sig:
             self._last_sig = sig
             if self._visible:
@@ -520,6 +540,15 @@ class Popover:
         names = [d["name"] for sec in self.ctl.devices().values() for d in sec]
         self.ctl.volumes.open_sweep(
             names, lambda n, lvl: self.post(lambda: self._volume_arrived(n, lvl)))
+
+    def _periodic_resweep(self) -> None:
+        # Rebuilds no longer piggyback on zeroconf churn, so refresh volumes
+        # (changed from phones etc.) on a slow deliberate cadence instead.
+        if not self._visible:
+            self._resweep_after = None
+            return
+        self._resweep()
+        self._resweep_after = self.win.after(30000, self._periodic_resweep)
 
     # ---- scrolling ------------------------------------------------------------
 
@@ -600,6 +629,8 @@ class Popover:
         self._rebuild_rows()
         self.startup_toggle.set(startup.is_enabled())
         self._resweep()
+        if self._resweep_after is None:
+            self._resweep_after = self.win.after(30000, self._periodic_resweep)
 
         self.win.attributes("-alpha", 0.0)
         self.win.deiconify()
@@ -618,6 +649,12 @@ class Popover:
             return
         self._visible = False
         self._cancel_fade()
+        if self._resweep_after is not None:
+            try:
+                self.win.after_cancel(self._resweep_after)
+            except Exception:
+                pass
+            self._resweep_after = None
         self.root.unbind_all("<MouseWheel>")
         self.win.withdraw()
         self.win.attributes("-alpha", 1.0)
