@@ -44,8 +44,9 @@ PLAYING / RECONNECTING(reason, attempt) / STOPPING / ERROR(msg).
   "Speaker buffering…", "Reconnecting: …"); errors surface in a wrapping
   error-container banner under the header; the active card shows an accent
   badge and "Casting · lag X s" subtitle.
-- CastSession gains on_state + client_count_fn: cast launched but no HTTP GET
-  within 12 s -> ERROR("speaker never fetched the stream - check firewall").
+- CastSession gains on_state + fetch_count_fn + on_gave_up: if no stream GET
+  ever arrives, bounded re-casts then a persistent firewall ERROR with
+  controller teardown (unmute, clear target) - never an endless spinner.
 - Sustained BUFFERING surfaces immediately (not hidden for the 60 s wedge
   window). RECONNECTING shows attempt count so endless retry never looks hung.
 - PC-muted indicator shown in the popover while local mute is engaged.

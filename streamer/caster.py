@@ -27,6 +27,18 @@ WATCHDOG_PERIOD = 5.0
 BUFFERING_WEDGE_SECONDS = 60.0
 BACKOFF_START, BACKOFF_CAP = 2.0, 30.0
 
+# The speaker fetches the stream over inbound HTTP; when Windows Firewall
+# blocks us on the CURRENT network profile (rules are per-profile and the
+# first-run prompt only covers the profile active at the time), that fetch
+# never arrives and re-casting can never help. Bound it: after this many
+# re-casts with zero stream fetches, stop retrying and surface a clear error.
+NO_FETCH_GRACE_SECONDS = 15.0
+NO_FETCH_MAX_RECASTS = 2
+NO_FETCH_ERROR = ("{name} never fetched the audio stream - Windows Firewall "
+                  "is likely blocking this app on the current network. Allow "
+                  "it for BOTH private and public networks, then press play "
+                  "again.")
+
 # Lag auto-trim: the Default Media Receiver buffers ~9 s of live WAV before it
 # starts playing, and that backlog would persist forever (we stream realtime,
 # it never drains). Seeking forward WITHIN the receiver's buffer skips the
@@ -96,7 +108,7 @@ class CastSession:
 
     def __init__(self, discovery: Discovery, safe_cast: SafeCast, port: int,
                  stream_type: str, capture, on_event=None, sent_seconds_fn=None,
-                 on_state=None, client_count_fn=None):
+                 on_state=None, fetch_count_fn=None, on_gave_up=None):
         self._discovery = discovery
         self._cast = safe_cast
         self._port = port
@@ -105,7 +117,10 @@ class CastSession:
         self._on_event = on_event or (lambda msg: None)
         self._sent_seconds_fn = sent_seconds_fn
         self._on_state = on_state or (lambda state, detail=None: None)
-        self._client_count_fn = client_count_fn
+        # monotonic count of stream GETs ever served - NOT a live connection
+        # sample, which could miss a short-lived fetch between polls
+        self._fetch_count_fn = fetch_count_fn
+        self._on_gave_up = on_gave_up or (lambda detail: None)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current_url = ""
@@ -113,6 +128,9 @@ class CastSession:
         self._played_at = 0.0            # wall time playback last confirmed
         self._last_trim = 0.0
         self._last_ui_state = ""
+        self._session_start = 0.0
+        self._ever_fetched = False       # any stream client this session?
+        self._no_fetch_recasts = 0
         self.recast_count = 0
         self.trim_count = 0
 
@@ -134,6 +152,9 @@ class CastSession:
 
     def start(self) -> None:
         self._play()
+        # grace clock starts AFTER launch: block_until_active alone can take
+        # most of the grace period on a slow group start
+        self._session_start = time.monotonic()
         self._thread = threading.Thread(target=self._watchdog, name="watchdog", daemon=True)
         self._thread.start()
 
@@ -157,13 +178,28 @@ class CastSession:
         while not self._stop.is_set():
             time.sleep(WATCHDOG_PERIOD)
             try:
+                self._note_fetch_activity()
                 self._emit_player_state()
                 reason = self._failure_reason()
                 if reason is None:
                     backoff = BACKOFF_START
                     attempt = 0
+                    if self._ever_fetched:
+                        self._no_fetch_recasts = 0
                     self._trim_lag()
                     continue
+                if self._never_fetched():
+                    self._no_fetch_recasts += 1
+                    if self._no_fetch_recasts > NO_FETCH_MAX_RECASTS:
+                        detail = NO_FETCH_ERROR.format(name=self._cast.name)
+                        log.error("giving up: stream never fetched after %d "
+                                  "re-casts (firewall?)", NO_FETCH_MAX_RECASTS)
+                        self._emit("ERROR", detail)
+                        # retrying cannot help; hand teardown to the controller
+                        # (unmute, stop capture/server, clear target) - the
+                        # controller re-emits ERROR so the banner survives.
+                        self._on_gave_up(detail)
+                        return
                 attempt += 1
                 log.warning("watchdog: %s - re-casting in %.0f s (attempt %d)",
                             reason, backoff, attempt)
@@ -177,6 +213,20 @@ class CastSession:
             except Exception as e:  # watchdog must never die
                 log.error("watchdog error: %s", e)
 
+    def _note_fetch_activity(self) -> None:
+        """Latch whether any stream GET has EVER been served this session."""
+        if self._fetch_count_fn is not None and self._fetch_count_fn() > 0:
+            self._ever_fetched = True
+
+    def _never_fetched(self) -> bool:
+        """The firewall-block signature: launched, past the grace period, and
+        not a single stream fetch this session. Session-scoped on purpose:
+        re-casts reset _played_at, so a per-attempt clock would never age past
+        the grace period."""
+        return (self._fetch_count_fn is not None
+                and not self._ever_fetched
+                and time.monotonic() - self._session_start > NO_FETCH_GRACE_SECONDS)
+
     def _emit_player_state(self) -> None:
         """Map live player state onto UI states each poll."""
         mc = self._cast.media_controller
@@ -188,15 +238,16 @@ class CastSession:
             self._emit("PLAYING", detail)
         elif state == "BUFFERING":
             self._emit("BUFFERING", self._cast.name)
-        elif (self._client_count_fn is not None and self._client_count_fn() == 0
-                and time.monotonic() - self._played_at > 12):
-            # launched but the speaker never fetched (or lost) the stream
-            self._emit("ERROR",
-                       "speaker never fetched the stream - check firewall/port")
 
     def _failure_reason(self) -> str | None:
         if not self._capture.healthy:
             return "capture unhealthy"
+
+        # A blocked fetch often parks the receiver in BUFFERING, which would
+        # otherwise only fail after the 60 s wedge window - minutes before the
+        # no-fetch bound could trip. Surface it directly.
+        if self._never_fetched():
+            return "stream never fetched"
 
         mc = self._cast.media_controller
         state = mc.status.player_state if mc.status else "UNKNOWN"

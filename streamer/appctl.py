@@ -123,7 +123,8 @@ class AppController:
             self.discovery, safe_cast, self.cfg["port"], self.cfg["stream_type"],
             self.capture,
             on_state=self._set_state,
-            client_count_fn=server.client_count,
+            fetch_count_fn=lambda: server.get_count,
+            on_gave_up=self._on_session_gave_up,
             sent_seconds_fn=lambda: (server.latest_client_bytes
                                      / capture.format.bytes_per_second))
         self.session.start()
@@ -131,7 +132,7 @@ class AppController:
         self.cfg["last_device"] = safe_cast.name
         cfg_mod.save(self.cfg)
 
-    def _do_stop(self) -> None:
+    def _do_stop(self, final: tuple[str, str | None] = ("IDLE", None)) -> None:
         self._set_state("STOPPING", self.cast_target)
         # Mute restore first: fast, local, and the thing users panic about.
         self.mute.release()
@@ -150,7 +151,13 @@ class AppController:
                     log.debug("teardown: %s", e)
         self.capture = self.pacer = self.server = None
         self.cast_target = None
-        self._set_state("IDLE")
+        self._set_state(*final)
+
+    def _on_session_gave_up(self, detail: str) -> None:
+        """Watchdog decided retrying can't help (stream never fetched). Tear
+        everything down - unmute, free capture/server, clear the target so the
+        card shows play again - but land on ERROR so the banner persists."""
+        self.enqueue(lambda: self._do_stop(final=("ERROR", detail)))
 
     # -- device info ------------------------------------------------------------------
 
