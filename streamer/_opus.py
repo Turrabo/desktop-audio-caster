@@ -29,7 +29,13 @@ class OpusError(RuntimeError):
     pass
 
 
+_lib_singleton = None
+
+
 def _load():
+    global _lib_singleton
+    if _lib_singleton is not None:
+        return _lib_singleton
     dll_path = ASSETS / "opus.dll"
     lib = ctypes.CDLL(str(dll_path))
     lib.opus_get_version_string.restype = ctypes.c_char_p
@@ -44,6 +50,7 @@ def _load():
     lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
     # opus_encoder_ctl is variadic; do NOT set argtypes (pass typed c_int args)
     lib.opus_encoder_ctl.restype = ctypes.c_int
+    _lib_singleton = lib
     return lib
 
 

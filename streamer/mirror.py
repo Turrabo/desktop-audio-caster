@@ -23,6 +23,7 @@ import socket
 import struct
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 
 from ._aesctr import FrameCrypto
@@ -64,10 +65,12 @@ MAX_UNACKED_FRAMES = 120         # openscreen constants.h kMaxUnackedFrames
 
 @dataclass
 class CastFeedback:
-    checkpoint_frame_id: int
-    checkpoint_truncated: int
+    checkpoint_truncated: int                   # raw 8-bit wire value (stall check)
     playout_delay_ms: int
     nacks: list = field(default_factory=list)   # (within_frame_id, packet_id, bitvec)
+    # CST2 frame-level ACK vector is parsed and asserted in tests, but the
+    # sender drives retransmission off the NACK list alone (ACKs are advisory);
+    # kept for completeness / future flow-control use.
     has_cst2_ack: bool = False
     ack_bitvector: bytes = b""
 
@@ -110,8 +113,7 @@ def _parse_feedback(pkt: bytes, sender_ssrc: int):
         return None
     ckpt, loss_count = pkt[16], pkt[17]
     playout_ms = struct.unpack_from(">H", pkt, 18)[0]
-    fb = CastFeedback(checkpoint_frame_id=ckpt, checkpoint_truncated=ckpt,
-                      playout_delay_ms=playout_ms)
+    fb = CastFeedback(checkpoint_truncated=ckpt, playout_delay_ms=playout_ms)
     pos = 20
     for _ in range(loss_count):
         if pos + 4 > len(pkt):
@@ -168,7 +170,9 @@ def make_signaling():
             self._seq_num = secrets.randbelow(2**30)
 
         def receive_message(self, _message, data: dict) -> bool:
-            if data.get("type") == "ANSWER":
+            # Ignore a late ANSWER to a previous OFFER (re-OFFER carries a new
+            # seqNum); accepting it would satisfy the current wait wrongly.
+            if data.get("type") == "ANSWER" and data.get("seqNum") == self._seq_num:
                 self._handle_answer(data)
             return True
 
@@ -178,6 +182,10 @@ def make_signaling():
                 self._answer_event.set()
                 return
             a = data.get("answer", {})
+            if "udpPort" not in a:                 # malformed -> clear reject
+                self._error = f"malformed ANSWER: {json.dumps(data)}"
+                self._answer_event.set()
+                return
             self._answer = StreamAnswer(
                 udp_port=a["udpPort"], receiver_ssrc=a.get("ssrcs", [0])[0],
                 send_indexes=a.get("sendIndexes", []),
@@ -213,25 +221,69 @@ def make_signaling():
     return _WebRTCController()
 
 
-def launch_mirroring_app(safe_cast, app_id: str, timeout: float = 10.0) -> None:
+class _AppReadyListener:
+    """Cast status listener that signals when a target app_id appears.
+
+    ONE is cached per cast (pychromecast has no listener-unregister, so a fresh
+    one per launch/recovery would leak - the same hazard safety.py works around
+    for MultizoneController). Re-armed per launch."""
+
+    def __init__(self) -> None:
+        self._target = None
+        self.event = threading.Event()
+
+    def arm(self, app_id: str) -> None:
+        self._target = app_id
+        self.event.clear()
+
+    def new_cast_status(self, status) -> None:
+        if status.app_id == self._target:
+            self.event.set()
+
+
+_app_listeners: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _app_ready_listener(safe_cast) -> _AppReadyListener:
+    # Cached per cast in a weak map (SafeCast is read-only, so we can't stash it
+    # as an attribute the way safety.py caches MultizoneController on the raw
+    # cast). One listener per cast - pychromecast can't unregister them.
+    listener = _app_listeners.get(safe_cast)
+    if listener is None:
+        listener = _AppReadyListener()
+        safe_cast.register_status_listener(listener)
+        _app_listeners[safe_cast] = listener
+    return listener
+
+
+def _wait(event: threading.Event, timeout: float, stop_check) -> bool:
+    """event.wait, but poll so a stop request breaks out early."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if stop_check():
+            return False
+        if event.wait(timeout=0.1):
+            return True
+    return False
+
+
+def launch_mirroring_app(safe_cast, app_id: str, timeout: float = 10.0,
+                         stop_check=lambda: False) -> None:
     """Launch a mirroring receiver app and wait until BOTH it is running AND
-    the webrtc namespace is advertised (polled; the namespace can lag app_id)."""
+    the webrtc namespace is advertised (polled; the namespace can lag app_id).
+    stop_check breaks the waits early (for a responsive Stop during recovery)."""
     sc = safe_cast.socket_client
     if safe_cast.app_id != app_id:
-        ready = threading.Event()
-
-        class _L:
-            def new_cast_status(self, status):
-                if status.app_id == app_id:
-                    ready.set()
-
-        safe_cast.register_status_listener(_L())
+        listener = _app_ready_listener(safe_cast)
+        listener.arm(app_id)
         log.info("launching app %s on %r", app_id, safe_cast.name)
         safe_cast.start_app(app_id)
-        if not ready.wait(timeout=timeout):
+        if not _wait(listener.event, timeout, stop_check):
             raise RuntimeError(f"app {app_id} did not launch (now {safe_cast.app_id})")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if stop_check():
+            raise RuntimeError("stopping")
         if WEBRTC_NAMESPACE in (sc.app_namespaces or []):
             return
         time.sleep(0.1)
@@ -288,12 +340,25 @@ class CastRtpSender:
         self.stats = FeedbackStats()
 
     def _build_packet(self, encrypted: bytes, frame_id: int) -> bytes:
+        # 12-byte RTP header + 6-byte Cast extension, then the encrypted payload
+        # (openscreen rtp_defines.h). RTP: byte0 0x80 = V2/no-pad/no-ext/CC0;
+        # byte1 = marker(0x80) | payload type; then seq(16), timestamp(32,
+        # sample count), SSRC(32). Cast ext: byte0 0x80 = key-frame bit +
+        # extension-count 0 (audio frames are always key frames); frame_id low
+        # 8 bits; packet_id 0; max_packet_id 0. The two trailing zeros HARDCODE
+        # one-packet-per-frame - valid only while a frame fits one datagram
+        # (~160 B Opus at 128 kbps, far under MTU). Fragmentation would need
+        # real packet_id / max_packet_id.
         rtp = struct.pack(">BBHII", 0x80, 0x80 | self._pt, self._seq & 0xFFFF,
                           self._rtp_ts & 0xFFFFFFFF, self._ssrc)
         cast = struct.pack(">BBHH", 0x80, frame_id & 0xFF, 0, 0)
         return rtp + cast + encrypted
 
     def _build_sr(self, rtp_ts: int) -> bytes:
+        # RTCP Sender Report (RFC 3550): byte0 0x80 = V2/RC0; 200 = SR packet
+        # type; 6 = length in 32-bit words minus one; then SSRC, the NTP/RTP
+        # timestamp pair (the lip-sync anchor the receiver needs before it can
+        # schedule playout), and the sender packet/octet counts.
         now = time.time()
         return struct.pack(">BBHIIIIII", 0x80, 200, 6, self._ssrc,
                            (int(now) + _NTP_EPOCH_OFFSET) & 0xFFFFFFFF,
@@ -302,11 +367,17 @@ class CastRtpSender:
                            self._octets & 0xFFFFFFFF)
 
     def send_frame(self, opus_frame: bytes) -> None:
-        if self._frame_id == 0:
-            self._sock.sendto(self._build_sr(0), self._dest)   # SR before frame 0
+        # A transient send error (full socket buffer, transient network) must
+        # not kill the pump thread; the watchdog handles a persistent fault via
+        # RTCP silence. Mirrors _sr_loop / _recv_loop's OSError tolerance.
         packet = self._build_packet(
             self._crypto.encrypt(self._frame_id, opus_frame), self._frame_id)
-        self._sock.sendto(packet, self._dest)
+        try:
+            if self._frame_id == 0:
+                self._sock.sendto(self._build_sr(0), self._dest)  # SR before frame 0
+            self._sock.sendto(packet, self._dest)
+        except OSError as exc:
+            log.debug("media sendto failed: %s", exc)
         if self._frame_id == 0:
             self._frame0_packet = packet
         self._history[self._frame_id & 0xFF] = (packet, self._frame_id)
@@ -317,8 +388,13 @@ class CastRtpSender:
         self._octets += len(opus_frame)
 
     def resend_frame0(self) -> None:
+        """Belt-and-braces re-send of frame 0 before receiver ACKs flow (used by
+        the transport probe; the shipped path also has NACK retransmission)."""
         if self._frame0_packet is not None:
-            self._sock.sendto(self._frame0_packet, self._dest)
+            try:
+                self._sock.sendto(self._frame0_packet, self._dest)
+            except OSError:
+                pass
 
     @property
     def last_sent_frame_id(self) -> int:
@@ -351,7 +427,10 @@ class CastRtpSender:
                 continue
             if now - self._last_retx.get(key, 0.0) < self.NACK_MIN_INTERVAL:
                 continue
-            self._sock.sendto(entry[0], self._dest)
+            try:
+                self._sock.sendto(entry[0], self._dest)
+            except OSError:
+                continue
             self._last_retx[key] = now
 
     def _recv_loop(self) -> None:
@@ -364,6 +443,7 @@ class CastRtpSender:
                 return
             now = time.monotonic()
             fbs = parse_compound(data, self._ssrc)
+            nacks = []
             with self.stats.lock:
                 self.stats.datagrams += 1
                 for fb in fbs:
@@ -381,7 +461,11 @@ class CastRtpSender:
                     self.stats.playout_delay_ms = fb.playout_delay_ms
                     if fb.nacks:
                         self.stats.nack_events += 1
-                        self._retransmit(fb.nacks)
+                        nacks.extend(fb.nacks)
+            # retransmit does socket I/O; never under stats.lock (snapshot() is
+            # polled every 100-500 ms by the session and must not block on send)
+            if nacks:
+                self._retransmit(nacks)
 
     def stop(self) -> None:
         self._running = False
@@ -466,7 +550,14 @@ class MirrorSink:
         self._stop.set()
         self._wake.set()
         if self._pump is not None:
-            self._pump.join(timeout=1)
+            self._pump.join(timeout=2)
+            if self._pump.is_alive():
+                # Never destroy the encoder under a live pump: an in-flight
+                # encode() would be a use-after-free in native code. Leaking it
+                # (encodes are sub-ms, so this realistically never happens) is
+                # the lesser evil - same discipline as capture.py's PortAudio.
+                log.warning("mirror pump did not stop; leaking encoder")
+                return
         if self._encoder is not None:
             self._encoder.close()
 
@@ -522,6 +613,10 @@ class MirrorSession:
         self._sink: MirrorSink | None = None
         self._watchdog: threading.Thread | None = None
         self._stop = threading.Event()
+        # Serializes stream create (in _establish) against destroy (in
+        # _teardown_stream) so a Stop landing mid-recovery can't leave a freshly
+        # built sender streaming after teardown ran (audio after Stop).
+        self._lifecycle = threading.Lock()
         self._playing = False
         self._answer_at = 0.0
         self._last_ui_state = ""
@@ -542,15 +637,22 @@ class MirrorSession:
             self._on_state(state, detail)
 
     def feed(self, pcm: bytes) -> None:
-        """Pacer sink. Safe before the sink exists (frames just wait)."""
-        if self._sink is not None:
-            self._sink.feed(pcm)
+        """Pacer sink. Capture to a local: the watchdog thread nulls self._sink
+        during routine re-OFFER recovery, and a check-then-use race here would
+        raise into Pacer._run and kill the shared pacer (silent total failure).
+        MirrorSink.feed on a stopped sink is harmless."""
+        sink = self._sink
+        if sink is not None:
+            sink.feed(pcm)
 
     def lag_seconds(self) -> float | None:
-        """Receiver's live playout delay (its own measure), in seconds."""
-        if not self._playing or self._sender is None:
+        """Receiver's LIVE playout delay from Cast Feedback, in seconds. NOTE:
+        semantically different from CastSession.lag_seconds (measured sent-minus
+        -played); this is the receiver's own target playout window (~0.4 s)."""
+        sender = self._sender
+        if not self._playing or sender is None:
             return None
-        pd = self._sender.stats.playout_delay_ms
+        pd = sender.stats.playout_delay_ms
         return pd / 1000.0 if pd >= 0 else None
 
     # -- lifecycle -----------------------------------------------------------
@@ -577,7 +679,8 @@ class MirrorSession:
         self._watchdog.start()
 
     def _establish(self) -> None:
-        """Launch (idempotent) + OFFER + fresh sender/sink. Raises on failure."""
+        """Launch (idempotent) + OFFER + fresh sender/sink. Raises on failure or
+        if Stop fires mid-build (so no threads start after Stop)."""
         self._app_id = self._launch()
         offer = StreamOffer(target_delay=self._target_delay, bit_rate=self._bitrate)
         answer = self._controller.send_offer(offer, ANSWER_TIMEOUT)
@@ -585,30 +688,40 @@ class MirrorSession:
             raise MirrorFirstFrameError(
                 f"stream refused (sendIndexes={answer.send_indexes})")
         self._log_constraints(answer)
-        self._sender = CastRtpSender(self._host, answer.udp_port, offer.ssrc,
-                                     offer.rtp_payload_type, offer.aes_key,
-                                     offer.aes_iv_mask)
-        self._sink = MirrorSink(self._sender.send_frame, bitrate=self._bitrate)
-        self._sender.start()
-        self._sink.start()
+        sender = CastRtpSender(self._host, answer.udp_port, offer.ssrc,
+                               offer.rtp_payload_type, offer.aes_key,
+                               offer.aes_iv_mask)
+        sink = MirrorSink(sender.send_frame, bitrate=self._bitrate)
+        with self._lifecycle:
+            if self._stop.is_set():
+                sender.stop()                 # close its socket; sink not started
+                raise MirrorFirstFrameError("stopping")
+            self._sender = sender
+            self._sink = sink
+            sender.start()
+            sink.start()
         self._answer_at = time.monotonic()
         self._playing = False
         self._emit("BUFFERING", self._cast.name)
 
     def _teardown_stream(self) -> None:
-        """Stop the current sink+sender (keep the connection for re-OFFER)."""
-        if self._sink is not None:
-            self._sink.stop()
-            self._sink = None
-        if self._sender is not None:
-            self._sender.stop()
-            self._sender = None
+        """Stop the current sink+sender (keep the connection for re-OFFER).
+        The swap is under _lifecycle so it can't interleave with _establish's
+        start; the stops run outside the lock (joins must not block a builder)."""
+        with self._lifecycle:
+            sink, self._sink = self._sink, None
+            sender, self._sender = self._sender, None
+        if sink is not None:
+            sink.stop()
+        if sender is not None:
+            sender.stop()
 
     def _launch(self) -> str:
         errors = []
         for app_id in (AUDIO_ONLY_APP_ID, AV_APP_ID):
             try:
-                launch_mirroring_app(self._cast, app_id, timeout=LAUNCH_TIMEOUT)
+                launch_mirroring_app(self._cast, app_id, timeout=LAUNCH_TIMEOUT,
+                                     stop_check=self._stop.is_set)
                 return app_id
             except RuntimeError as exc:
                 errors.append(f"{app_id}: {exc}")
@@ -704,7 +817,8 @@ class MirrorSession:
         return False
 
     def status(self) -> dict:
-        snap = self._sender.stats.snapshot() if self._sender else {}
+        sender = self._sender
+        snap = sender.stats.snapshot() if sender else {}
         return {"device": self._cast.name, "mode": "mirror",
                 "playing": self._playing, "recasts": self.recast_count, **snap}
 
