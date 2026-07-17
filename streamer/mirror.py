@@ -14,6 +14,7 @@ third-party crypto dependency); Opus via streamer._opus (assets/opus.dll).
 """
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -25,9 +26,21 @@ import time
 from dataclasses import dataclass, field
 
 from ._aesctr import FrameCrypto
-from ._opus import FRAME_SAMPLES, OpusEncoder
+from ._opus import CHANNELS, FRAME_SAMPLES, SAMPLE_RATE, OpusEncoder
 
 log = logging.getLogger(__name__)
+
+# Eligibility: the encoder is fixed at 48 kHz stereo 16-bit; a capture format
+# that differs is routed to the HTTP path (no resampler in v1).
+ELIGIBLE_RATE = SAMPLE_RATE
+ELIGIBLE_CHANNELS = CHANNELS
+ELIGIBLE_SAMPWIDTH = 2
+FRAME_BYTES = FRAME_SAMPLES * ELIGIBLE_CHANNELS * ELIGIBLE_SAMPWIDTH  # 1920
+
+
+def eligible_format(fmt) -> bool:
+    return (fmt.rate == ELIGIBLE_RATE and fmt.channels == ELIGIBLE_CHANNELS
+            and fmt.sampwidth == ELIGIBLE_SAMPWIDTH)
 
 # -- protocol constants ------------------------------------------------------
 
@@ -378,5 +391,235 @@ class CastRtpSender:
             pass
         try:
             self._crypto.close()
+        except Exception:
+            pass
+
+
+# -- reframing sink (pacer -> 480-sample Opus frames) ------------------------
+
+class MirrorSink:
+    """Carves the pacer's variable-size chunks into exact 480-sample frames,
+    Opus-encodes each, and hands packets to `on_packet`. feed() runs on the
+    pacer thread and never blocks (encode happens on a pump thread); the
+    bounded frame queue drops oldest to cap added latency, like server clients.
+    """
+
+    QUEUE_FRAMES = 30            # ~0.3 s of 10 ms frames
+
+    def __init__(self, on_packet, bitrate: int = 128000):
+        self._on_packet = on_packet
+        self._bitrate = bitrate
+        self._encoder: OpusEncoder | None = None   # created in start()
+        self._buf = bytearray()
+        self._frames: collections.deque = collections.deque(maxlen=self.QUEUE_FRAMES)
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._pump: threading.Thread | None = None
+        self.dropped_frames = 0
+        self.sent_frames = 0
+
+    def pending_frames(self) -> int:
+        """Frames carved and awaiting encode (test/telemetry helper)."""
+        with self._lock:
+            return len(self._frames)
+
+    def feed(self, pcm: bytes) -> None:
+        """Pacer thread: reframe into 480-sample PCM frames, enqueue."""
+        with self._lock:
+            self._buf.extend(pcm)
+            while len(self._buf) >= FRAME_BYTES:
+                frame = bytes(self._buf[:FRAME_BYTES])
+                del self._buf[:FRAME_BYTES]
+                if len(self._frames) == self._frames.maxlen:
+                    self.dropped_frames += 1   # deque drops the oldest itself
+                self._frames.append(frame)
+        self._wake.set()
+
+    def start(self) -> None:
+        self._encoder = OpusEncoder(self._bitrate)
+        self._stop.clear()
+        self._pump = threading.Thread(target=self._run, name="mirror-pump", daemon=True)
+        self._pump.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(timeout=0.1)
+            self._wake.clear()
+            while True:
+                with self._lock:
+                    if not self._frames:
+                        break
+                    frame = self._frames.popleft()
+                try:
+                    packet = self._encoder.encode(frame)
+                except Exception as exc:
+                    log.warning("opus encode failed: %s", exc)
+                    continue
+                self._on_packet(packet)
+                self.sent_frames += 1
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._pump is not None:
+            self._pump.join(timeout=1)
+        if self._encoder is not None:
+            self._encoder.close()
+
+
+# -- session (CastSession-shaped) --------------------------------------------
+
+FIRST_CHECKPOINT_DEADLINE = 3.0     # s after ANSWER to see the first checkpoint
+LAUNCH_TIMEOUT = 5.0
+ANSWER_TIMEOUT = 4.0
+MONITOR_PERIOD = 0.5
+
+
+class MirrorFirstFrameError(RuntimeError):
+    """Raised when a mirror session cannot reach PLAYING (start-time failure)."""
+
+
+class MirrorSession:
+    """One mirroring session to one device/group. Exposes the same surface as
+    CastSession (start/stop/lag_seconds/trim_count/recast_count/safe_cast and
+    the on_state contract) so appctl, the popover, the tray, and the cli need
+    no mirror-specific code paths.
+
+    M2 scope: launch + OFFER/ANSWER + reframe/encode/send + first-checkpoint
+    gate + PLAYING/lag telemetry. NACK is already handled inside CastRtpSender;
+    the recovery watchdog and HTTP fallback are added in M3.
+    """
+
+    def __init__(self, discovery, safe_cast, capture, on_state=None,
+                 target_delay=DEFAULT_TARGET_DELAY_MS, bitrate=128000):
+        self._discovery = discovery
+        self._cast = safe_cast
+        self._capture = capture
+        self._on_state = on_state or (lambda state, detail=None: None)
+        self._target_delay = target_delay
+        self._bitrate = bitrate
+        self._sender: CastRtpSender | None = None
+        self._sink: MirrorSink | None = None
+        self._monitor: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._playing = False
+        self._answer_at = 0.0
+        self._last_ui_state = ""
+        self._app_id = ""
+        self.trim_count = 0        # mirror does not trim; kept for the contract
+        self.recast_count = 0
+
+    @property
+    def safe_cast(self):
+        return self._cast
+
+    def _emit(self, state: str, detail: str | None = None) -> None:
+        key = f"{state}:{detail}"
+        if key != self._last_ui_state:
+            self._last_ui_state = key
+            self._on_state(state, detail)
+
+    def feed(self, pcm: bytes) -> None:
+        """Pacer sink. Safe before the sink exists (frames just wait)."""
+        if self._sink is not None:
+            self._sink.feed(pcm)
+
+    def lag_seconds(self) -> float | None:
+        """Receiver's live playout delay (its own measure), in seconds."""
+        if not self._playing or self._sender is None:
+            return None
+        pd = self._sender.stats.playout_delay_ms
+        return pd / 1000.0 if pd >= 0 else None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self) -> None:
+        if not eligible_format(self._capture.format):
+            raise MirrorFirstFrameError(
+                f"capture {self._capture.format} not mirror-eligible")
+        self._emit("LAUNCHING", self._cast.name)
+        self._app_id = self._launch()
+
+        controller = make_signaling()
+        self._cast.register_handler(controller)
+        offer = StreamOffer(target_delay=self._target_delay, bit_rate=self._bitrate)
+        answer = controller.send_offer(offer, ANSWER_TIMEOUT)
+        if not answer.accepted:
+            raise MirrorFirstFrameError(
+                f"stream refused (sendIndexes={answer.send_indexes})")
+        self._log_constraints(answer)
+
+        host = self._cast.socket_client.host
+        self._sender = CastRtpSender(host, answer.udp_port, offer.ssrc,
+                                     offer.rtp_payload_type, offer.aes_key,
+                                     offer.aes_iv_mask)
+        self._sink = MirrorSink(self._sender.send_frame, bitrate=self._bitrate)
+        self._sender.start()
+        self._sink.start()
+        self._answer_at = time.monotonic()
+        self._emit("BUFFERING", self._cast.name)
+
+        self._monitor = threading.Thread(target=self._run_monitor,
+                                         name="mirror-monitor", daemon=True)
+        self._monitor.start()
+
+    def _launch(self) -> str:
+        """Try the audio-only receiver first, then the A/V one. Returns the
+        app id that took the session."""
+        errors = []
+        for app_id in (AUDIO_ONLY_APP_ID, AV_APP_ID):
+            try:
+                launch_mirroring_app(self._cast, app_id, timeout=LAUNCH_TIMEOUT)
+                return app_id
+            except RuntimeError as exc:
+                errors.append(f"{app_id}: {exc}")
+        raise MirrorFirstFrameError("; ".join(errors))
+
+    def _log_constraints(self, answer) -> None:
+        c = (answer.constraints or {}).get("audio") if answer.constraints else None
+        if c and ("minDelay" in c or "maxDelay" in c):
+            log.info("receiver delay window: min=%s max=%s ms",
+                     c.get("minDelay"), c.get("maxDelay"))
+
+    def _run_monitor(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(MONITOR_PERIOD)
+            if self._sender is None:
+                continue
+            snap = self._sender.stats.snapshot()
+            if not self._playing:
+                if snap["checkpoint"] >= 0:
+                    self._playing = True
+                elif time.monotonic() - self._answer_at > FIRST_CHECKPOINT_DEADLINE:
+                    log.error("no checkpoint within %.0fs of ANSWER - mirror "
+                              "start failed", FIRST_CHECKPOINT_DEADLINE)
+                    self._emit("ERROR", "mirror never started")
+                    return
+            if self._playing:
+                lag = self.lag_seconds()
+                detail = (self._cast.name if lag is None
+                          else f"{self._cast.name}|{lag:.1f}")
+                self._emit("PLAYING", detail)
+
+    def status(self) -> dict:
+        snap = self._sender.stats.snapshot() if self._sender else {}
+        return {"device": self._cast.name, "mode": "mirror",
+                "playing": self._playing, **snap}
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._monitor is not None:
+            self._monitor.join(timeout=1)
+        if self._sink is not None:
+            self._sink.stop()
+        if self._sender is not None:
+            self._sender.stop()
+        try:
+            self._cast.quit_app()
+        except Exception as exc:
+            log.debug("quit_app: %s", exc)
+        try:
+            self._cast.disconnect(timeout=5)
         except Exception:
             pass
