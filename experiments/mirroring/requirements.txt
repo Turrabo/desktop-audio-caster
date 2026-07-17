@@ -1,0 +1,3 @@
+# Spike-only dependencies (NOT shipped in the exe; streamer/ never imports these)
+av>=18
+cryptography>=41
