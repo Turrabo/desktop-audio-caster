@@ -24,7 +24,7 @@ Cast-a-URL rebuild ("reliable rebuild" option). Python core + system tray UI.
 WASAPI loopback capture ──► single-clock pacer (real frames | exact-gap silence fill)
         │                                  │
         └── format probe ──► 16-bit PCM convert ──► per-client bounded queue (frame-aligned,
-                                                    drop-oldest ~1 s, drops logged)
+                                                    drop-oldest, drops logged)
                                                           │
                                               aiohttp /stream.wav (endless WAV)
                                                           ▲
@@ -37,7 +37,7 @@ pychromecast: resident CastBrowser discovery, connect, play_media(url), status, 
 |---|---|
 | `streamer/capture.py` | WASAPI loopback of the chosen render device. Probes the device mix format at open; converts to 16-bit PCM at the device's native rate (no resample). Health signal: consecutive read errors or device-invalidated → capture restart; surfaced to watchdog. Handles default-device change (re-open + force media-session restart, since a WAV header can't change mid-flight). |
 | `streamer/pacer.py` | ONE monotonic sample clock. Pulls real frames when available; when capture is silent/stopped, synthesizes exactly the missing sample count (no independent timer, no second clock — this is the anti-drift core). |
-| `streamer/server.py` | aiohttp on a fixed configurable port. Endless WAV: RIFF/data sizes 0xFFFFFFFF, fresh header per connection, ignore/200 Range requests, no Content-Length. Header fields derived from the ACTUAL capture format. Per-client queue: frame-aligned drop-oldest (~1 s), drop events logged. |
+| `streamer/server.py` | aiohttp on a fixed configurable port. Endless WAV: RIFF/data sizes 0xFFFFFFFF, fresh header per connection, ignore/200 Range requests, no Content-Length. Header fields derived from the ACTUAL capture format. Per-client queue: frame-aligned drop-oldest (`CLIENT_QUEUE_SECONDS`), drop events logged. |
 | `streamer/caster.py` | pychromecast wrapper. Resident CastBrowser (zeroconf) so speaker reboots / new IPs / group-leader migration are re-resolved live, not just at connect time. `play_media(url, "audio/wav")`. Watchdog: player state IDLE, sustained BUFFERING (>60 s), capture-health failure, or local IP change → tear down, re-derive stream URL from the current route-to-speaker source IP, re-cast with backoff (2 s → 30 s cap). |
 | `streamer/safety.py` | Single choke point for ALL volume ops, enforced not assumed: (1) every `Chromecast` handle is wrapped in a proxy that does not expose `set_volume`/`volume_up`/`volume_down`; (2) config-driven rules — `max_volume` cap, `office_names` protection incl. group-membership resolution via MultizoneController (fail closed), `allow_group_volume` — all permissive in shipped defaults; (3) automated test greps the codebase — `set_volume|volume_up|volume_down` may appear only in safety.py and its tests. |
 | `streamer/localmute.py` | Only if the muted-loopback probe passes: mute local endpoint on cast start (pycaw), unmute on stop via try/finally + atexit, PLUS unmute-on-next-start recovery (atexit doesn't run on hard kill). |

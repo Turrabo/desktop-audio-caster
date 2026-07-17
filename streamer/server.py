@@ -5,7 +5,8 @@ Contract (per plan review):
 - Fresh header per connection; Range requests answered 200 with the full
   live stream (the receiver probes with Range; there is no past to seek to).
 - No Content-Length; chunked transfer.
-- Per-client bounded queue, frame-aligned drop-oldest (~1 s), drops logged.
+- Per-client bounded queue, frame-aligned drop-oldest (CLIENT_QUEUE_SECONDS),
+  drops logged.
 """
 from __future__ import annotations
 
