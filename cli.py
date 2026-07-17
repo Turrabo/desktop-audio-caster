@@ -43,8 +43,10 @@ def cmd_start(args) -> int:
         # per-run only: cast_mode is a disk-edited policy key, not in
         # APP_OWNED_KEYS, so this override is never persisted back to config
         ctl.cfg["cast_mode"] = args.mode
-    if args.no_mute:
-        ctl.cfg["mute_local_while_casting"] = False
+    if args.output_mode:
+        ctl.cfg["output_mode"] = args.output_mode
+    elif args.no_mute:
+        ctl.cfg["output_mode"] = "both"   # legacy alias: don't mute the PC
 
     name = args.device or ctl.cfg["last_device"]
     if not name:
@@ -95,8 +97,11 @@ def main() -> int:
     p_start.add_argument("--stream-type", choices=["LIVE", "BUFFERED"])
     p_start.add_argument("--mode", choices=["auto", "mirror", "http"],
                          help="cast path (default from config: auto)")
+    p_start.add_argument("--output-mode",
+                         choices=["speakers", "this_pc", "both", "auto"],
+                         help="where audio is audible while casting")
     p_start.add_argument("--no-mute", action="store_true",
-                         help="do not mute local output while casting")
+                         help="legacy alias for --output-mode both")
     p_start.add_argument("--duration", type=int, default=None,
                          help="stop automatically after N seconds (testing)")
 

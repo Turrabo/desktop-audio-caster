@@ -50,6 +50,13 @@ class AppController:
         self.cast_target: str | None = None
         self.cast_mode_active: str = "http"   # resolved path of the live session
         self._mirror_feed = None       # session.feed while mirroring, else None
+        # When set, the pacer feeds SILENCE to the cast (speakers go quiet)
+        # while local PC playback is untouched - the "this_pc" output mode and
+        # the desk phase of "auto". Feeding zeros, not writing device volume, so
+        # it is instant, reversible, and never touches the volume choke point.
+        self._cast_silenced = False
+        self._output_mode = "speakers"       # active mode of the live cast
+        self._auto_stop: threading.Event | None = None   # auto-monitor stopper
         self.volumes = VolumeManager(self)
 
     # -- events ----------------------------------------------------------
@@ -105,11 +112,13 @@ class AppController:
     def _pacer_sink(self, chunk: bytes) -> None:
         """Fan-out from the single pacer clock: the HTTP server always (a cheap
         no-op when it has no clients, e.g. while mirroring) plus the mirror
-        session when one is active."""
-        self.server.feed(chunk)
+        session when one is active. When silenced (this_pc / auto desk phase) the
+        CAST gets zeros while local PC playback is untouched."""
+        out = bytes(len(chunk)) if self._cast_silenced else chunk
+        self.server.feed(out)
         mf = self._mirror_feed
         if mf is not None:
-            mf(chunk)
+            mf(out)
 
     def _mirror_available(self, fmt) -> tuple[bool, str | None]:
         """Whether mirror mode can run for this capture format. Lazy-imports the
@@ -141,10 +150,8 @@ class AppController:
         self.capture.start()
 
         safe_cast = self.discovery.connect(name)
-        if self.cfg["mute_local_while_casting"]:
-            self.mute.engage()
-            self._notify("mute", True)
         self.cast_target = safe_cast.name
+        self._apply_output_mode(self.cfg["output_mode"])
 
         can_mirror, why = self._mirror_available(self.capture.format)
         if self.cfg["cast_mode"] == "mirror" and not can_mirror:
@@ -202,11 +209,100 @@ class AppController:
                                      / capture.format.bytes_per_second))
         self.session.start()
 
+    # -- live latency ---------------------------------------------------------
+
+    def set_target_delay(self, ms: int) -> None:
+        self.enqueue(lambda: self._do_set_target_delay(ms))
+
+    def _do_set_target_delay(self, ms: int) -> None:
+        cfg_mod.set_user_value("mirror_target_delay_ms", ms)
+        self.cfg["mirror_target_delay_ms"] = ms
+        session = self.session
+        if session is not None and hasattr(session, "set_target_delay"):
+            session.set_target_delay(ms)      # live re-OFFER (mirror only)
+        self._notify("target_delay", ms)
+
+    # -- output routing -------------------------------------------------------
+
+    def set_output_mode(self, mode: str) -> None:
+        self.enqueue(lambda: self._do_set_output_mode(mode))
+
+    def _do_set_output_mode(self, mode: str) -> None:
+        cfg_mod.set_user_value("output_mode", mode)
+        self.cfg["output_mode"] = mode
+        if self.session is not None:      # apply live; else next cast picks it up
+            self._apply_output_mode(mode)
+        self._notify("output_mode", mode)
+
+    def _apply_output_mode(self, mode: str) -> None:
+        """Actuate an output mode on the live cast: the local PC mute (via
+        LocalMute) and the cast-silence gate. Assumes a cast is up."""
+        from . import localmute
+        self._output_mode = mode
+        self._stop_auto_monitor()
+        if mode == "speakers":            # PC muted+pinned, full-strength cast
+            self.mute.engage()
+            self._notify("mute", True)
+            self._cast_silenced = False
+        elif mode == "this_pc":           # PC audible, speakers fed silence
+            self.mute.release()
+            self._notify("mute", False)
+            self._cast_silenced = True
+        elif mode == "both":              # both audible (cast follows PC volume)
+            self.mute.release()
+            self._notify("mute", False)
+            self._cast_silenced = False
+        elif mode == "auto":              # the PC's own mute is the switch
+            self.mute.release()           # never force; the user drives mute
+            self._notify("mute", False)
+            self._cast_silenced = not localmute.endpoint_muted()
+            self._start_auto_monitor()
+        else:
+            log.warning("unknown output_mode %r; treating as speakers", mode)
+            self._apply_output_mode("speakers")
+
+    def _start_auto_monitor(self) -> None:
+        self._auto_stop = threading.Event()
+        threading.Thread(target=self._auto_monitor, args=(self._auto_stop,),
+                         name="auto-output", daemon=True).start()
+
+    def _stop_auto_monitor(self) -> None:
+        if self._auto_stop is not None:
+            self._auto_stop.set()
+            self._auto_stop = None
+
+    def _auto_monitor(self, stop: threading.Event) -> None:
+        """Watch the endpoint mute; on a SETTLED change, flip the cast-silence
+        gate inversely (PC muted -> speakers play; PC unmuted -> desk only). The
+        settle absorbs a transient toggle (a Teams call, a media-key fumble) so
+        a brief unmute doesn't strobe the whole house."""
+        from . import localmute
+        settle = 1.5
+        acted = localmute.endpoint_muted()
+        candidate, since = acted, time.monotonic()
+        while not stop.wait(0.5):
+            cur = localmute.endpoint_muted()
+            if cur != candidate:
+                candidate, since = cur, time.monotonic()
+            elif cur != acted and time.monotonic() - since >= settle:
+                acted = cur
+                self.enqueue(lambda muted=cur: self._do_auto_silence(not muted))
+
+    def _do_auto_silence(self, silenced: bool) -> None:
+        # Stale-guard: only act if still auto and still the same live cast.
+        if self._output_mode != "auto" or self.cast_target is None:
+            return
+        self._cast_silenced = silenced
+        log.info("auto output: cast %s",
+                 "silenced (listening at PC)" if silenced else "live (speakers)")
+
     def _do_stop(self, final: tuple[str, str | None] = ("IDLE", None)) -> None:
         self._set_state("STOPPING", self.cast_target)
+        self._stop_auto_monitor()
         # Mute restore first: fast, local, and the thing users panic about.
         self.mute.release()
         self._notify("mute", False)
+        self._cast_silenced = False
         if self.session is not None:
             try:
                 self.session.stop()

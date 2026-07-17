@@ -131,6 +131,24 @@ class TestFailureReason(unittest.TestCase):
     def test_format_change_is_a_permanent_reason(self):
         self.assertIn("capture format changed", mirror.PERMANENT_REASONS)
 
+    def test_transient_none_app_id_is_not_a_change(self):
+        # A re-OFFER briefly leaves the receiver appless; a None must not read
+        # as "someone else cast to it" (RTCP silence catches a dead receiver).
+        s = make_session(sender=FakeSender(checkpoint=500, last_feedback_at=99.9,
+                                           checkpoint_raw_since=99.9))
+        s._app_id = "85CDB22F"
+        s._cast = FakeCast()
+        s._cast.app_id = None
+        self.assertIsNone(s._failure_reason(100.0))
+
+
+class TestSetTargetDelay(unittest.TestCase):
+    def test_sets_target_and_flags_reoffer(self):
+        s = make_session(sender=FakeSender())
+        s.set_target_delay(50)
+        self.assertEqual(s._target_delay, 50)
+        self.assertTrue(s._reoffer_requested.is_set())
+
 
 class TestRecovery(unittest.TestCase):
     def test_reoffer_exhaustion_returns_false(self):

@@ -40,6 +40,15 @@ def _marker_path() -> Path:
     return config_dir() / MARKER
 
 
+def endpoint_muted() -> bool:
+    """Current endpoint mute state (for the 'auto' output mode, which watches
+    the user's own mute rather than forcing one)."""
+    try:
+        return bool(_endpoint().GetMute())
+    except OSError:
+        return False
+
+
 def recover_from_crash() -> None:
     """Call at app start: if a marker survived a crash, restore the endpoint."""
     path = _marker_path()

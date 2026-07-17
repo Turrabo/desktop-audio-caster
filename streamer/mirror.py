@@ -613,6 +613,9 @@ class MirrorSession:
         self._sink: MirrorSink | None = None
         self._watchdog: threading.Thread | None = None
         self._stop = threading.Event()
+        # Set by set_target_delay; consumed by the watchdog thread so the
+        # re-OFFER never runs concurrently with the watchdog's own recovery.
+        self._reoffer_requested = threading.Event()
         # Serializes stream create (in _establish) against destroy (in
         # _teardown_stream) so a Stop landing mid-recovery can't leave a freshly
         # built sender streaming after teardown ran (audio after Stop).
@@ -644,6 +647,13 @@ class MirrorSession:
         sink = self._sink
         if sink is not None:
             sink.feed(pcm)
+
+    def set_target_delay(self, ms: int) -> None:
+        """Request a live latency change. Only flips a flag + the target; the
+        watchdog thread does the actual re-OFFER, so this never races the
+        watchdog's own recovery (all stream rebuilds stay on one thread)."""
+        self._target_delay = ms
+        self._reoffer_requested.set()
 
     def lag_seconds(self) -> float | None:
         """Receiver's LIVE playout delay from Cast Feedback, in seconds. NOTE:
@@ -755,7 +765,11 @@ class MirrorSession:
             return "capture unhealthy"
         if not eligible_format(self._capture.format):
             return "capture format changed"
-        if self._app_id and self._cast.app_id != self._app_id:
+        # A DIFFERENT non-None app means someone else cast to it. A transient
+        # None (the app relaunching, e.g. during a rapid re-OFFER) is not a
+        # change - the RTCP-silence check catches a genuinely dead receiver.
+        current_app = self._cast.app_id
+        if self._app_id and current_app and current_app != self._app_id:
             return "receiver app changed"
         try:
             from .caster import source_ip_for
@@ -776,10 +790,31 @@ class MirrorSession:
             return "checkpoint stalled"
         return None
 
+    def _reoffer(self) -> bool:
+        """Re-negotiate with the current target delay (a live latency change).
+        Runs ON the watchdog thread. BUFFERING -> PLAYING, no RECONNECTING noise."""
+        self._teardown_stream()
+        try:
+            self._establish()
+        except Exception as exc:
+            log.warning("re-OFFER failed: %s", exc)
+            return False
+        if self._await_playing():
+            self._emit("PLAYING", self._playing_detail())
+            return True
+        return False
+
     def _run_watchdog(self) -> None:
         backoff = BACKOFF_START
         while not self._stop.is_set():
             time.sleep(MONITOR_PERIOD)
+            if self._reoffer_requested.is_set():
+                self._reoffer_requested.clear()
+                log.info("re-OFFER with target_delay=%d ms", self._target_delay)
+                if not self._reoffer():
+                    self._on_fallback_needed("latency change failed")
+                    return
+                continue
             reason = self._failure_reason(time.monotonic())
             if reason is None:
                 backoff = BACKOFF_START
