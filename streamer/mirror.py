@@ -258,7 +258,10 @@ class FeedbackStats:
         with self.lock:
             return {"rtcp_datagrams": self.datagrams, "cast_feedbacks": self.feedbacks,
                     "checkpoint": self.checkpoint, "playout_delay_ms": self.playout_delay_ms,
-                    "nack_events": self.nack_events}
+                    "nack_events": self.nack_events,
+                    "first_feedback_at": self.first_feedback_at,
+                    "last_feedback_at": self.last_feedback_at,
+                    "checkpoint_raw_since": self.checkpoint_raw_since}
 
 
 class CastRtpSender:
@@ -474,6 +477,10 @@ FIRST_CHECKPOINT_DEADLINE = 3.0     # s after ANSWER to see the first checkpoint
 LAUNCH_TIMEOUT = 5.0
 ANSWER_TIMEOUT = 4.0
 MONITOR_PERIOD = 0.5
+RTCP_SILENCE_TIMEOUT = 6.0          # no feedback at all this long -> dead
+CHECKPOINT_STALL_TIMEOUT = 2.0      # raw checkpoint byte frozen while sending
+REOFFER_MAX_ATTEMPTS = 2            # mid-session recoveries before HTTP fallback
+BACKOFF_START, BACKOFF_CAP = 2.0, 30.0
 
 
 class MirrorFirstFrameError(RuntimeError):
@@ -486,27 +493,35 @@ class MirrorSession:
     the on_state contract) so appctl, the popover, the tray, and the cli need
     no mirror-specific code paths.
 
-    M2 scope: launch + OFFER/ANSWER + reframe/encode/send + first-checkpoint
-    gate + PLAYING/lag telemetry. NACK is already handled inside CastRtpSender;
-    the recovery watchdog and HTTP fallback are added in M3.
+    Reliability model:
+    - Start-time failure (never reached PLAYING) raises MirrorFirstFrameError
+      from start(); appctl falls straight back to HTTP (no retry - a broken
+      protocol is deterministic).
+    - Mid-session loss (was PLAYING) is recovered by re-OFFER with backoff up
+      to REOFFER_MAX_ATTEMPTS; only then does on_fallback_needed fire, so a
+      transient Wi-Fi blip does not cost the 1.1 s HTTP regression.
     """
 
     def __init__(self, discovery, safe_cast, capture, on_state=None,
-                 target_delay=DEFAULT_TARGET_DELAY_MS, bitrate=128000):
+                 on_fallback_needed=None, target_delay=DEFAULT_TARGET_DELAY_MS,
+                 bitrate=128000):
         self._discovery = discovery
         self._cast = safe_cast
         self._capture = capture
         self._on_state = on_state or (lambda state, detail=None: None)
+        self._on_fallback_needed = on_fallback_needed or (lambda reason: None)
         self._target_delay = target_delay
         self._bitrate = bitrate
+        self._controller = None
         self._sender: CastRtpSender | None = None
         self._sink: MirrorSink | None = None
-        self._monitor: threading.Thread | None = None
+        self._watchdog: threading.Thread | None = None
         self._stop = threading.Event()
         self._playing = False
         self._answer_at = 0.0
         self._last_ui_state = ""
-        self._app_id = ""
+        self._host = ""
+        self._local_ip = ""
         self.trim_count = 0        # mirror does not trim; kept for the contract
         self.recast_count = 0
 
@@ -539,34 +554,51 @@ class MirrorSession:
             raise MirrorFirstFrameError(
                 f"capture {self._capture.format} not mirror-eligible")
         self._emit("LAUNCHING", self._cast.name)
-        self._app_id = self._launch()
+        self._host = self._cast.socket_client.host
+        from .caster import source_ip_for
+        self._local_ip = source_ip_for(self._host)
+        self._controller = make_signaling()
+        self._cast.register_handler(self._controller)
 
-        controller = make_signaling()
-        self._cast.register_handler(controller)
+        self._establish()                         # raises on start-time failure
+        if not self._await_playing():
+            self._teardown_stream()
+            raise MirrorFirstFrameError("no checkpoint within deadline")
+        self._emit("PLAYING", self._playing_detail())
+
+        self._watchdog = threading.Thread(target=self._run_watchdog,
+                                          name="mirror-watchdog", daemon=True)
+        self._watchdog.start()
+
+    def _establish(self) -> None:
+        """Launch (idempotent) + OFFER + fresh sender/sink. Raises on failure."""
+        self._launch()
         offer = StreamOffer(target_delay=self._target_delay, bit_rate=self._bitrate)
-        answer = controller.send_offer(offer, ANSWER_TIMEOUT)
+        answer = self._controller.send_offer(offer, ANSWER_TIMEOUT)
         if not answer.accepted:
             raise MirrorFirstFrameError(
                 f"stream refused (sendIndexes={answer.send_indexes})")
         self._log_constraints(answer)
-
-        host = self._cast.socket_client.host
-        self._sender = CastRtpSender(host, answer.udp_port, offer.ssrc,
+        self._sender = CastRtpSender(self._host, answer.udp_port, offer.ssrc,
                                      offer.rtp_payload_type, offer.aes_key,
                                      offer.aes_iv_mask)
         self._sink = MirrorSink(self._sender.send_frame, bitrate=self._bitrate)
         self._sender.start()
         self._sink.start()
         self._answer_at = time.monotonic()
+        self._playing = False
         self._emit("BUFFERING", self._cast.name)
 
-        self._monitor = threading.Thread(target=self._run_monitor,
-                                         name="mirror-monitor", daemon=True)
-        self._monitor.start()
+    def _teardown_stream(self) -> None:
+        """Stop the current sink+sender (keep the connection for re-OFFER)."""
+        if self._sink is not None:
+            self._sink.stop()
+            self._sink = None
+        if self._sender is not None:
+            self._sender.stop()
+            self._sender = None
 
     def _launch(self) -> str:
-        """Try the audio-only receiver first, then the A/V one. Returns the
-        app id that took the session."""
         errors = []
         for app_id in (AUDIO_ONLY_APP_ID, AV_APP_ID):
             try:
@@ -582,39 +614,93 @@ class MirrorSession:
             log.info("receiver delay window: min=%s max=%s ms",
                      c.get("minDelay"), c.get("maxDelay"))
 
-    def _run_monitor(self) -> None:
+    def _playing_detail(self) -> str:
+        lag = self.lag_seconds()
+        return self._cast.name if lag is None else f"{self._cast.name}|{lag:.1f}"
+
+    def _await_playing(self) -> bool:
+        """Poll until the first checkpoint (True) or the deadline (False)."""
+        while not self._stop.is_set():
+            if self._sender and self._sender.stats.snapshot()["checkpoint"] >= 0:
+                self._playing = True
+                return True
+            if time.monotonic() - self._answer_at > FIRST_CHECKPOINT_DEADLINE:
+                return False
+            time.sleep(0.1)
+        return False
+
+    def _failure_reason(self, now: float) -> str | None:
+        """Why the live session is unhealthy, or None. Pure enough to unit-test
+        with a fake clock + synthetic FeedbackStats."""
+        if not self._capture.healthy:
+            return "capture unhealthy"
+        if not eligible_format(self._capture.format):
+            return "capture format changed"
+        try:
+            from .caster import source_ip_for
+            if source_ip_for(self._host) != self._local_ip:
+                return "local IP changed"
+        except OSError:
+            return "no route to speaker"
+        if self._sender is None:
+            return "sender gone"
+        snap = self._sender.stats.snapshot()
+        last_fb = snap["last_feedback_at"]
+        if last_fb is not None and now - last_fb > RTCP_SILENCE_TIMEOUT:
+            return "rtcp silence"
+        # raw checkpoint byte frozen while we keep sending = wedged receiver
+        raw_since = snap["checkpoint_raw_since"]
+        if (snap["checkpoint"] >= 0 and raw_since
+                and now - raw_since > CHECKPOINT_STALL_TIMEOUT):
+            return "checkpoint stalled"
+        return None
+
+    def _run_watchdog(self) -> None:
+        backoff = BACKOFF_START
         while not self._stop.is_set():
             time.sleep(MONITOR_PERIOD)
-            if self._sender is None:
+            reason = self._failure_reason(time.monotonic())
+            if reason is None:
+                backoff = BACKOFF_START
+                self._emit("PLAYING", self._playing_detail())
                 continue
-            snap = self._sender.stats.snapshot()
-            if not self._playing:
-                if snap["checkpoint"] >= 0:
-                    self._playing = True
-                elif time.monotonic() - self._answer_at > FIRST_CHECKPOINT_DEADLINE:
-                    log.error("no checkpoint within %.0fs of ANSWER - mirror "
-                              "start failed", FIRST_CHECKPOINT_DEADLINE)
-                    self._emit("ERROR", "mirror never started")
-                    return
-            if self._playing:
-                lag = self.lag_seconds()
-                detail = (self._cast.name if lag is None
-                          else f"{self._cast.name}|{lag:.1f}")
-                self._emit("PLAYING", detail)
+            log.warning("mirror unhealthy: %s", reason)
+            if not self._recover(reason, backoff):
+                log.error("mirror recovery exhausted (%s) -> HTTP fallback", reason)
+                self._on_fallback_needed(reason)
+                return
+            backoff = min(backoff * 2, BACKOFF_CAP)
+
+    def _recover(self, reason: str, backoff: float) -> bool:
+        """Re-OFFER up to REOFFER_MAX_ATTEMPTS. True if PLAYING was restored."""
+        for attempt in range(1, REOFFER_MAX_ATTEMPTS + 1):
+            if self._stop.is_set():
+                return False
+            self._emit("RECONNECTING", f"{reason} (attempt {attempt})")
+            self._teardown_stream()
+            if self._stop.wait(backoff):
+                return False
+            try:
+                self._establish()
+            except Exception as exc:
+                log.warning("re-OFFER attempt %d failed: %s", attempt, exc)
+                continue
+            self.recast_count += 1
+            if self._await_playing():
+                self._emit("PLAYING", self._playing_detail())
+                return True
+        return False
 
     def status(self) -> dict:
         snap = self._sender.stats.snapshot() if self._sender else {}
         return {"device": self._cast.name, "mode": "mirror",
-                "playing": self._playing, **snap}
+                "playing": self._playing, "recasts": self.recast_count, **snap}
 
     def stop(self) -> None:
         self._stop.set()
-        if self._monitor is not None:
-            self._monitor.join(timeout=1)
-        if self._sink is not None:
-            self._sink.stop()
-        if self._sender is not None:
-            self._sender.stop()
+        if self._watchdog is not None:
+            self._watchdog.join(timeout=MONITOR_PERIOD + 1)
+        self._teardown_stream()
         try:
             self._cast.quit_app()
         except Exception as exc:

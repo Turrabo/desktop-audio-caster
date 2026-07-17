@@ -49,6 +49,11 @@ class StreamServer:
         # latest client's delivery counters (for end-to-end lag estimation)
         self.latest_client_bytes = 0
         self.latest_client_connected_at = 0.0
+        # While mirroring, the server stays bound (fast fallback) but must NOT
+        # serve the cleartext WAV to the subnet - the audio is going out
+        # AES-encrypted over the mirror path, so an open /stream.wav would be a
+        # silent plaintext leak. appctl flips this per cast mode.
+        self.serving = True
 
     # -- feeding (called from pacer thread) ---------------------------------
 
@@ -73,6 +78,13 @@ class StreamServer:
     # -- HTTP ----------------------------------------------------------------
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        if not self.serving:
+            # Mirror mode is active; do not leak cleartext audio. get_count is
+            # deliberately NOT incremented (it is the mirror-independent HTTP
+            # fetch signal the firewall watchdog reads).
+            log.info("stream request from %s refused: mirror mode active",
+                     request.remote)
+            raise web.HTTPServiceUnavailable(text="mirror mode active")
         self.get_count += 1
         peer = request.remote
         log.info("stream client connected: %s (%s %s, range=%r)",
