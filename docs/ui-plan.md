@@ -18,7 +18,7 @@ states, DPI, cli port, fast exit.)
 streamer/appctl.py     AppController: owns Discovery, pipeline, the session
                        (CastSession HTTP path or MirrorSession sub-second Cast
                        mirroring - same on_state/lag/stop surface, picked by
-                       cast_mode + eligibility; see docs/mirror-plan.md),
+                       cast_mode + eligibility; see docs/mirror.md),
                        LocalMute, VolumeManager. ONE worker thread with an op
                        queue - start/stop/switch/volume are serialized; UI
                        buttons disable during transitional states.
@@ -95,11 +95,12 @@ PLAYING / RECONNECTING(reason, attempt) / STOPPING / ERROR(msg).
   no longer a silent no-op).
 - cli.py ports onto AppController (pipeline wiring has exactly one home).
 
-## Testing constraints (Claude-run)
+## Testing constraints
 
-Volume live-test only on a single non-Office speaker, <=0.03, restore prior
-level. Group volume not live-tested by Claude ("Everywhere" contains Office);
-code path identical (leader write), user verifies audibly.
+Volume live-test only on a single non-protected speaker, <=0.03, restore prior
+level. Group volume isn't live-tested automatically when the group contains a
+protected speaker; the code path is identical (leader write) and is verified
+audibly by a human.
 
 ## Out of scope
 

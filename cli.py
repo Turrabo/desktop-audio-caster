@@ -40,6 +40,8 @@ def cmd_start(args) -> int:
     if args.stream_type:
         ctl.cfg["stream_type"] = args.stream_type
     if args.mode:
+        # per-run only: cast_mode is a disk-edited policy key, not in
+        # APP_OWNED_KEYS, so this override is never persisted back to config
         ctl.cfg["cast_mode"] = args.mode
     if args.no_mute:
         ctl.cfg["mute_local_while_casting"] = False

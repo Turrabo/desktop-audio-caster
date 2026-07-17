@@ -120,8 +120,11 @@ class LoopbackCapture:
                                 channels=min(2, int(lb["maxInputChannels"])) or 2,
                                 sampwidth=2)
         if new_fmt != self.format:
-            # A WAV stream's header cannot change mid-flight; the caster must
-            # restart the media session. Surfaced via format_changed.
+            # A WAV header (HTTP path) and the 48 kHz Opus encoder (mirror path)
+            # are both fixed at open time, so a mid-flight rate change needs a
+            # session restart. The mirror watchdog polls capture.format via
+            # mirror.eligible_format() and triggers a full restart; the HTTP
+            # path currently tolerates it (one re-anchor).
             log.warning("capture format changed %s -> %s", self.format, new_fmt)
             self.format = new_fmt
         self._stream = self._pa.open(

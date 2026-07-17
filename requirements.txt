@@ -1,4 +1,5 @@
 pychromecast>=14
+zeroconf>=0.80
 pyaudiowpatch>=0.2.12
 aiohttp>=3.12
 pystray>=0.19

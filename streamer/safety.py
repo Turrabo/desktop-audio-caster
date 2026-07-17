@@ -10,8 +10,8 @@ devices, group volume allowed):
      protected list, membership must resolve and contain no protected device -
      fail closed.
 
-Restrictive configs are used by Claude-run tests (see the project memory:
-Claude keeps its own testing at <=3%). An automated test
+The restrictive configs exist so automated tests can exercise this choke point
+at low volume; the shipped app is unguarded. An automated test
 (tests/test_no_rogue_volume.py) asserts that volume-setting calls appear
 nowhere outside this module.
 """

@@ -60,7 +60,7 @@ the app falls back to the HTTP path automatically, so casting keeps working
 even though mirroring rides an undocumented protocol Google could change; set
 `cast_mode` to `http` to pin the stable path. Audio via a bundled
 [libopus](https://opus-codec.org/); encryption via Windows' own crypto (no
-extra dependencies). See [docs/mirror-plan.md](docs/mirror-plan.md).
+extra dependencies). See [docs/mirror.md](docs/mirror.md).
 
 ## Silent-machine behaviour
 
@@ -78,7 +78,7 @@ other module gains a volume call.
 
 ## Build from source
 
-Requires Python 3.11+ on Windows (3.13 recommended for packaging).
+Requires Python 3.11+ on Windows (3.14 used for the current build).
 
 ```
 git clone https://github.com/Turrabo/desktop-audio-caster
