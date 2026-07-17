@@ -22,13 +22,15 @@ import threading
 import time
 
 from streamer.caster import Discovery
-from . import webrtc_controller as wc
-from .cast_rtp import (CastRtpSender, FRAME0_RESENDS, FRAME0_RESEND_SPACING)
+from streamer import mirror as wc
+from streamer.mirror import CastRtpSender
 from .opus_source import OpusSource
 
 log = logging.getLogger("stream_probe")
 FRAME_INTERVAL = 0.01           # 10 ms
 STATUS_PERIOD = 5.0
+FRAME0_RESENDS = 3
+FRAME0_RESEND_SPACING = 0.05
 
 
 def run(device: str, seconds: int, pt: int, target_delay: int,
@@ -54,11 +56,11 @@ def run(device: str, seconds: int, pt: int, target_delay: int,
 
         safe_cast.register_status_listener(_AppWatch())
 
-        sig = wc.MirroringSignaling.create()
-        safe_cast.register_handler(sig.controller)
+        controller = wc.make_signaling()
+        safe_cast.register_handler(controller)
         offer = wc.StreamOffer(rtp_payload_type=pt, target_delay=target_delay,
                                bit_rate=bit_rate)
-        answer = sig.send_offer(offer)
+        answer = controller.send_offer(offer, 4.0)
         result["answer"] = {"udpPort": answer.udp_port,
                             "constraints": answer.constraints,
                             "sendIndexes": answer.send_indexes}

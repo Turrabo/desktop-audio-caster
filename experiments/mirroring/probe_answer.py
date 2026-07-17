@@ -25,7 +25,7 @@ import sys
 import time
 
 from streamer.caster import Discovery
-from . import webrtc_controller as wc
+from streamer import mirror as wc
 
 log = logging.getLogger("probe")
 
@@ -37,16 +37,16 @@ def probe_app(safe_cast, app_id: str, pt: int, target_delay: int) -> dict:
         wc.launch_mirroring_app(safe_cast, app_id)
     except RuntimeError as exc:
         msg = str(exc)
-        out["outcome"] = "NO_NAMESPACE" if "advertised" in msg else "NO_LAUNCH"
+        out["outcome"] = "NO_NAMESPACE" if "no urn" in msg else "NO_LAUNCH"
         out["detail"] = msg
         return out
 
-    sig = wc.MirroringSignaling.create()
-    safe_cast.register_handler(sig.controller)
+    controller = wc.make_signaling()
+    safe_cast.register_handler(controller)
     offer = wc.StreamOffer(rtp_payload_type=pt, target_delay=target_delay)
     out["offer"] = {"ssrc": offer.ssrc, "pt": pt, "targetDelay": target_delay}
     try:
-        answer = sig.send_offer(offer)
+        answer = controller.send_offer(offer, 4.0)
     except RuntimeError as exc:
         out["outcome"] = "NO_ANSWER" if "no ANSWER" in str(exc) else "REJECTED"
         out["detail"] = str(exc)

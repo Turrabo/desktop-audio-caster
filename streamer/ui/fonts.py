@@ -10,21 +10,10 @@ from __future__ import annotations
 
 import ctypes
 import logging
-import sys
-from pathlib import Path
+
+from ..assets import ASSETS
 
 log = logging.getLogger(__name__)
-
-
-def _assets_dir() -> Path:
-    """assets/ next to the sources in dev, or unpacked beside the frozen exe
-    (PyInstaller sets sys._MEIPASS to the bundle root in both build modes)."""
-    if getattr(sys, "frozen", False):
-        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "assets"
-    return Path(__file__).resolve().parents[2] / "assets"
-
-
-ASSETS = _assets_dir()
 FR_PRIVATE = 0x10
 
 ICON_FONT_PATH = ASSETS / "MaterialIconsRound-Regular.otf"
@@ -51,7 +40,7 @@ ICONS = {
 _loaded = False
 
 
-def _add_private(path: Path) -> bool:
+def _add_private(path) -> bool:
     if not path.exists():
         log.warning("font missing at %s", path)
         return False

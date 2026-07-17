@@ -1,36 +1,12 @@
-# Third-party code in experiments/mirroring/
+# Third-party code (mirror spike)
 
-`webrtc_controller.py` (and, in later spike milestones, `cast_rtp.py`) are
-adapted from [chromecast-sink](https://github.com/Nerahikada/chromecast-sink),
-used under the MIT License. Full licence text and upstream copyright:
+The Cast mirroring protocol logic proven by this spike now lives in
+`streamer/mirror.py`; its third-party attribution (chromecast-sink MIT,
+openscreen BSD reference, libopus BSD-3) is recorded in the shipped manifest
+at [assets/README.md](../../assets/README.md).
 
-```
-MIT License
-
-Copyright (c) 2026 ねらひかだ
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-Protocol behaviour is cross-checked against
-[chromium/openscreen](https://github.com/chromium/openscreen) (BSD-3-Clause),
-used as a reference specification only (no openscreen code is copied).
-
-If any of this graduates from experiments/ into the shipped app, this notice
-moves into the exe's third-party licence manifest alongside assets/README.md.
+What remains here is spike-only tooling that never ships:
+- `opus_source.py` - synthetic PyAV Opus source for the probes (PyAV is a
+  dev-only dependency; see requirements.txt).
+- `probe_answer.py`, `stream_probe.py` - hardware probes that import the
+  protocol from `streamer.mirror`.

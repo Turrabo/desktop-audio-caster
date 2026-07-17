@@ -8,7 +8,7 @@ the spec itself calls a trap.
 import struct
 import unittest
 
-from experiments.mirroring.rtcp_feedback import (
+from streamer.mirror import (
     ALL_PACKETS_LOST, CastFeedback, expand_frame_id, parse_compound)
 
 SENDER_SSRC = 0x41727470

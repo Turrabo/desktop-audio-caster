@@ -1,3 +1,6 @@
-# Spike-only dependencies (NOT shipped in the exe; streamer/ never imports these)
+# Spike-only dependency (NOT shipped in the exe; streamer/ never imports this).
+# Used by opus_source.py to synthesise Opus test frames for the probes. The
+# shipped app encodes via streamer/_opus.py (ctypes -> assets/opus.dll) and
+# encrypts via streamer/_aesctr.py (Windows CNG), neither of which needs a
+# third-party package.
 av>=18
-cryptography>=41
