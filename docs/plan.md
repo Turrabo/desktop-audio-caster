@@ -8,9 +8,10 @@ single-clock pacing, network failure modes, HTTP contract.)
 ## User requirements
 
 - Whole-device audio (not per-tab / per-app).
-- Reliability and simplicity above all. Latency: measured ~1.1 s solo / ~1.3 s group after
-  watchdog auto-trim (seek past the receiver's ~9 s pre-buffer); user originally asked for
-  zero — sub-second remains a possible future mirroring-protocol project.
+- Reliability and simplicity above all. Latency on this HTTP path: measured ~1.1 s solo /
+  ~1.3 s group after watchdog auto-trim (seek past the receiver's ~9 s pre-buffer). The
+  sub-second Cast mirroring path built on top of this is the default when eligible and
+  falls back here; see [mirror-plan.md](mirror-plan.md).
 - The laptop must not make audible sound while casting.
 - The app ships with NO volume guards (config defaults permissive). Volume restraint applies
   only to Claude-run testing: ≤3%, and no volume ops on "Office" (see project memory
@@ -117,5 +118,7 @@ Apply to Claude-run tests only — the app itself is unguarded:
 
 ## Out of scope (this build)
 
-- Sub-second mirroring (openscreen port) — possible later project; this app is the fallback.
 - Multi-PC, non-Google devices, EQ/resample options, per-app capture.
+
+(Sub-second Cast mirroring, once a future item here, is now built - it is the
+default path with this HTTP path as its fallback. See [mirror-plan.md](mirror-plan.md).)

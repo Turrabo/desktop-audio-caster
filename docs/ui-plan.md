@@ -15,7 +15,10 @@ states, DPI, cli port, fast exit.)
 ## Architecture
 
 ```
-streamer/appctl.py     AppController: owns Discovery, pipeline, CastSession,
+streamer/appctl.py     AppController: owns Discovery, pipeline, the session
+                       (CastSession HTTP path or MirrorSession sub-second Cast
+                       mirroring - same on_state/lag/stop surface, picked by
+                       cast_mode + eligibility; see docs/mirror-plan.md),
                        LocalMute, VolumeManager. ONE worker thread with an op
                        queue - start/stop/switch/volume are serialized; UI
                        buttons disable during transitional states.

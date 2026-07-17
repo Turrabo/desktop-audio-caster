@@ -14,10 +14,14 @@ for pkg in ("pychromecast", "zeroconf", "pyaudiowpatch", "pycaw",
     binaries += b
     hiddenimports += h
 
-# Bundled fonts + app icon, resolved at runtime via sys._MEIPASS (see
-# streamer/ui/fonts.py).
+# Bundled fonts, app icon, and opus.dll, resolved at runtime via sys._MEIPASS
+# (see streamer/assets.py). opus.dll is a static-CRT build depending only on
+# KERNEL32, so shipping it as data (not a scanned binary) is safe.
 datas += [("assets", "assets")]
-hiddenimports += ["pystray._win32"]
+# The mirror stack is imported lazily in appctl (so a bad import only routes to
+# HTTP), so name it explicitly to guarantee it is frozen in.
+hiddenimports += ["pystray._win32", "streamer.mirror", "streamer._opus",
+                  "streamer._aesctr"]
 
 a = Analysis(
     ["launch_tray.pyw"],
@@ -27,7 +31,10 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter.test", "test", "unittest"],
+    # av + cryptography are spike-only (experiments/mirroring); the shipped app
+    # encodes via ctypes->opus.dll and encrypts via Windows CNG, so neither is
+    # needed at runtime. Excluding them keeps the exe lean.
+    excludes=["tkinter.test", "test", "unittest", "av", "cryptography"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

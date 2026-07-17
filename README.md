@@ -39,13 +39,28 @@ Config + logs live in `%APPDATA%\desktop-audio-streamer\`.
 
 ## How it works
 
-Reliability model: battle-tested [pychromecast](https://github.com/home-assistant-libs/pychromecast)
-for discovery/control, lossless PCM WAV over HTTP on the LAN (no encoder), one
-single-clock pacer so latency is fixed and can never drift, a resident discovery
-browser plus one watchdog for recovery. The receiver pre-buffers ~9 s of live WAV;
-the watchdog auto-trims that by seeking to the live edge, landing at ~1.1 s end-to-end
-(~1.3 s for groups), measured. It re-trims automatically if lag ever creeps past 2 s.
-True sub-second would need the Cast mirroring protocol — different project.
+Two cast paths, chosen automatically per speaker (`cast_mode` in config:
+`auto` by default, or force `mirror` / `http`):
+
+- **Mirror (default when possible)** — the same low-latency Cast protocol
+  Chrome uses for tab casting: Opus audio over encrypted RTP, negotiated
+  directly with the speaker. Sub-second end-to-end (~0.4 s receiver playout
+  delay, measured), solo and group. Needs 48 kHz stereo capture (the usual
+  Windows default); anything else uses the HTTP path.
+- **HTTP (automatic fallback)** — battle-tested
+  [pychromecast](https://github.com/home-assistant-libs/pychromecast) plus
+  lossless PCM WAV over the LAN to the Default Media Receiver. The receiver
+  pre-buffers ~9 s of live WAV; one watchdog auto-trims that by seeking to the
+  live edge, landing at ~1.1 s end-to-end (~1.3 s for groups), measured, and
+  re-trims if lag creeps past 2 s.
+
+Both share one single-clock pacer (fixed, drift-free latency), a resident
+discovery browser, and a watchdog. If a mirror session can't start or drops,
+the app falls back to the HTTP path automatically, so casting keeps working
+even though mirroring rides an undocumented protocol Google could change; set
+`cast_mode` to `http` to pin the stable path. Audio via a bundled
+[libopus](https://opus-codec.org/); encryption via Windows' own crypto (no
+extra dependencies). See [docs/mirror-plan.md](docs/mirror-plan.md).
 
 ## Silent-machine behaviour
 

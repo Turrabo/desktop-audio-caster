@@ -9,11 +9,12 @@
   Apache License 2.0. Loaded the same process-private way; the UI falls back
   to Segoe UI when missing.
 - `opus.dll` — libopus 1.5.2, from the [official Xiph release](https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz),
-  licensed BSD-3-Clause (full text below). Built locally with MSVC 2022
-  (UCRT, `-DOPUS_BUILD_SHARED_LIBRARY=ON`); no MinGW runtime dependencies.
-  Loaded via ctypes by `streamer/_opus.py` for the mirror cast path.
+  licensed BSD-3-Clause (full text below). Built locally with MSVC 2022 and
+  the STATIC runtime (`-DOPUS_BUILD_SHARED_LIBRARY=ON -DOPUS_STATIC_RUNTIME=ON`)
+  so the DLL depends only on KERNEL32 - no VC++ redistributable needed on a
+  clean machine. Loaded via ctypes by `streamer/_opus.py` for the mirror path.
   - source tarball SHA-256: `65C1D2F78B9F2FB20082C38CBE47C951AD5839345876E46941612EE87F9A7CE1`
-  - opus.dll SHA-256: `E857200F9A9DD5A7893769F4DB09D9917ECA1ED686990A31428D4261CC7B48EA`
+  - opus.dll SHA-256: `55D379A72D216F45926D5CC0BC60053502CC4328AA80C1113296837B99157A5D`
 
 ## Mirror cast path — third-party source
 
