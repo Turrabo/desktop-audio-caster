@@ -18,6 +18,11 @@ DEFAULTS = {
     "capture_device": None,       # None = default output; else substring of device name
     "mute_local_while_casting": True,
     "firewall_registered_image": None,  # exe path we've registered/asked for
+    # Cast path: "auto" uses mirroring when eligible (48 kHz stereo + opus.dll)
+    # and falls back to HTTP otherwise; "mirror" forces it (still falls back if
+    # ineligible); "http" pins the original Default-Media-Receiver path.
+    "cast_mode": "auto",
+    "mirror_target_delay_ms": 400,
 }
 
 

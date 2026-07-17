@@ -45,9 +45,11 @@ class AppController:
         self.capture: LoopbackCapture | None = None
         self.pacer: Pacer | None = None
         self.server: StreamServer | None = None
-        self.session: CastSession | None = None
+        self.session = None            # CastSession or MirrorSession
         self.mute = LocalMute()
         self.cast_target: str | None = None
+        self.cast_mode_active: str = "http"   # resolved path of the live session
+        self._mirror_feed = None       # session.feed while mirroring, else None
         self.volumes = VolumeManager(self)
 
     # -- events ----------------------------------------------------------
@@ -100,6 +102,31 @@ class AppController:
     def stop_cast(self) -> None:
         self.enqueue(self._do_stop)
 
+    def _pacer_sink(self, chunk: bytes) -> None:
+        """Fan-out from the single pacer clock: the HTTP server always (a cheap
+        no-op when it has no clients, e.g. while mirroring) plus the mirror
+        session when one is active."""
+        self.server.feed(chunk)
+        mf = self._mirror_feed
+        if mf is not None:
+            mf(chunk)
+
+    def _mirror_available(self, fmt) -> tuple[bool, str | None]:
+        """Whether mirror mode can run for this capture format. Lazy-imports the
+        mirror stack so a bad import (missing opus.dll etc.) can never break app
+        startup - it just routes to HTTP."""
+        if self.cfg["cast_mode"] == "http":
+            return False, "cast_mode=http"
+        try:
+            from . import mirror, _opus
+        except Exception as e:               # pragma: no cover - import guard
+            return False, f"mirror import failed: {e}"
+        if not mirror.eligible_format(fmt):
+            return False, "capture is not 48 kHz/stereo/16-bit"
+        if not _opus.available():
+            return False, "opus.dll not loadable"
+        return True, None
+
     def _do_start(self, name: str) -> None:
         if self.session is not None:
             self._do_stop()  # switch target = stop + start, same worker
@@ -108,7 +135,7 @@ class AppController:
         self.capture = LoopbackCapture(on_data=lambda d: self.pacer.feed(d),
                                        device_hint=self.cfg["capture_device"])
         self.server = StreamServer(self.capture.format, self.cfg["port"])
-        self.pacer = Pacer(self.capture.format, sink=self.server.feed)
+        self.pacer = Pacer(self.capture.format, sink=self._pacer_sink)
         self.server.start()
         self.pacer.start()
         self.capture.start()
@@ -117,7 +144,53 @@ class AppController:
         if self.cfg["mute_local_while_casting"]:
             self.mute.engage()
             self._notify("mute", True)
+        self.cast_target = safe_cast.name
 
+        can_mirror, why = self._mirror_available(self.capture.format)
+        if self.cfg["cast_mode"] == "mirror" and not can_mirror:
+            log.warning("cast_mode=mirror but ineligible (%s); using HTTP", why)
+        started_mirror = can_mirror and self._try_start_mirror(safe_cast)
+        if started_mirror:
+            self.cast_mode_active = "mirror"
+        else:
+            if can_mirror:
+                # the failed mirror attempt disconnected the cast; reconnect
+                safe_cast = self.discovery.connect(name)
+            self._start_http(safe_cast)
+            self.cast_mode_active = "http"
+
+        self.cfg["last_device"] = safe_cast.name
+        cfg_mod.save(self.cfg)
+
+    def _try_start_mirror(self, safe_cast) -> bool:
+        """Attempt a mirror session. On any start-time failure, tear it down and
+        return False so the caller falls back to HTTP (no retry - a broken
+        protocol is deterministic)."""
+        from .mirror import MirrorSession
+        self.server.serving = False       # no cleartext WAV while mirroring
+        session = MirrorSession(
+            self.discovery, safe_cast, self.capture,
+            on_state=self._set_state,
+            on_fallback_needed=self._on_fallback_needed,
+            target_delay=self.cfg["mirror_target_delay_ms"])
+        self._mirror_feed = session.feed
+        try:
+            session.start()               # blocks until PLAYING or raises
+        except Exception as e:            # any start-time failure -> HTTP
+            log.warning("mirror start failed (%s); falling back to HTTP", e)
+            self._mirror_feed = None
+            try:
+                session.stop()
+            except Exception:
+                pass
+            self.server.serving = True
+            return False
+        self.session = session
+        return True
+
+    def _start_http(self, safe_cast) -> None:
+        self.server.serving = True
+        self._mirror_feed = None
         server, capture = self.server, self.capture
         self.session = CastSession(
             self.discovery, safe_cast, self.cfg["port"], self.cfg["stream_type"],
@@ -128,9 +201,6 @@ class AppController:
             sent_seconds_fn=lambda: (server.latest_client_bytes
                                      / capture.format.bytes_per_second))
         self.session.start()
-        self.cast_target = safe_cast.name
-        self.cfg["last_device"] = safe_cast.name
-        cfg_mod.save(self.cfg)
 
     def _do_stop(self, final: tuple[str, str | None] = ("IDLE", None)) -> None:
         self._set_state("STOPPING", self.cast_target)
@@ -150,6 +220,7 @@ class AppController:
                 except Exception as e:
                     log.debug("teardown: %s", e)
         self.capture = self.pacer = self.server = None
+        self._mirror_feed = None
         self.cast_target = None
         self._set_state(*final)
 
@@ -158,6 +229,40 @@ class AppController:
         everything down - unmute, free capture/server, clear the target so the
         card shows play again - but land on ERROR so the banner persists."""
         self.enqueue(lambda: self._do_stop(final=("ERROR", detail)))
+
+    def _on_fallback_needed(self, reason: str) -> None:
+        """Mirror watchdog exhausted recovery. Swap to the HTTP path WITHOUT
+        unmuting or tearing down capture/server. Fired from the watchdog thread,
+        so enqueue; the op is stale-guarded against a user stop/switch that
+        already replaced the session."""
+        failed = self.session
+        self.enqueue(lambda: self._do_fallback(failed, reason))
+
+    def _do_fallback(self, failed_session, reason: str) -> None:
+        if self.session is not failed_session or self.cast_target is None:
+            log.info("fallback for %s ignored (session already replaced)", reason)
+            return
+        log.warning("mirror -> HTTP fallback for %r: %s", self.cast_target, reason)
+        name = self.cast_target
+        # A capture format change also invalidated the HTTP server's WAV header
+        # (built at the old rate), so an in-place swap would still be wrong-pitch.
+        # Rebuild the whole pipeline at the new format via a clean restart.
+        from . import mirror
+        if self.capture is not None and not mirror.eligible_format(self.capture.format):
+            log.warning("capture format changed under mirror; full restart")
+            self._do_stop()
+            self._do_start(name)
+            return
+        self._mirror_feed = None
+        try:
+            failed_session.stop()      # stops only the mirror session
+        except Exception as e:
+            log.debug("mirror stop during fallback: %s", e)
+        # capture, pacer, server, mute and cast_target all stay as-is; the HTTP
+        # server starts serving again and a fresh connection carries the DMR.
+        safe_cast = self.discovery.connect(name)
+        self._start_http(safe_cast)
+        self.cast_mode_active = "http"
 
     # -- device info ------------------------------------------------------------------
 

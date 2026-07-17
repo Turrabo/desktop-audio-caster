@@ -482,6 +482,11 @@ CHECKPOINT_STALL_TIMEOUT = 2.0      # raw checkpoint byte frozen while sending
 REOFFER_MAX_ATTEMPTS = 2            # mid-session recoveries before HTTP fallback
 BACKOFF_START, BACKOFF_CAP = 2.0, 30.0
 
+# Reasons a re-OFFER cannot fix (the fault is local, not the receiver): skip
+# recovery and fall back immediately. A capture format change also invalidates
+# the HTTP server's WAV header, so appctl fixes it with a full pipeline restart.
+PERMANENT_REASONS = {"capture format changed"}
+
 
 class MirrorFirstFrameError(RuntimeError):
     """Raised when a mirror session cannot reach PLAYING (start-time failure)."""
@@ -522,6 +527,7 @@ class MirrorSession:
         self._last_ui_state = ""
         self._host = ""
         self._local_ip = ""
+        self._app_id = ""
         self.trim_count = 0        # mirror does not trim; kept for the contract
         self.recast_count = 0
 
@@ -572,7 +578,7 @@ class MirrorSession:
 
     def _establish(self) -> None:
         """Launch (idempotent) + OFFER + fresh sender/sink. Raises on failure."""
-        self._launch()
+        self._app_id = self._launch()
         offer = StreamOffer(target_delay=self._target_delay, bit_rate=self._bitrate)
         answer = self._controller.send_offer(offer, ANSWER_TIMEOUT)
         if not answer.accepted:
@@ -636,6 +642,8 @@ class MirrorSession:
             return "capture unhealthy"
         if not eligible_format(self._capture.format):
             return "capture format changed"
+        if self._app_id and self._cast.app_id != self._app_id:
+            return "receiver app changed"
         try:
             from .caster import source_ip_for
             if source_ip_for(self._host) != self._local_ip:
@@ -665,6 +673,10 @@ class MirrorSession:
                 self._emit("PLAYING", self._playing_detail())
                 continue
             log.warning("mirror unhealthy: %s", reason)
+            if reason in PERMANENT_REASONS:
+                # re-OFFER cannot fix a local fault; hand straight to appctl
+                self._on_fallback_needed(reason)
+                return
             if not self._recover(reason, backoff):
                 log.error("mirror recovery exhausted (%s) -> HTTP fallback", reason)
                 self._on_fallback_needed(reason)

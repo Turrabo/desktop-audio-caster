@@ -1,8 +1,13 @@
 """CLI for the desktop audio streamer (same engine as the tray app).
 
   python cli.py devices
-  python cli.py start "Living Room" [--stream-type LIVE|BUFFERED] [--no-mute]
+  python cli.py start "Living Room" [--mode auto|mirror|http]
+                                    [--stream-type LIVE|BUFFERED] [--no-mute]
                                     [--duration N]
+
+The status line prints mode=<resolved path>: "mirror" (sub-second Cast
+mirroring) or "http" (the Default Media Receiver). --mode mirror still falls
+back to http when the capture format or opus.dll make mirroring ineligible.
 
 `start` runs in the foreground; Ctrl+C stops casting, restores local audio,
 and quits the receiver app on the speaker.
@@ -34,6 +39,8 @@ def cmd_start(args) -> int:
     ctl = AppController()
     if args.stream_type:
         ctl.cfg["stream_type"] = args.stream_type
+    if args.mode:
+        ctl.cfg["cast_mode"] = args.mode
     if args.no_mute:
         ctl.cfg["mute_local_while_casting"] = False
 
@@ -58,7 +65,8 @@ def cmd_start(args) -> int:
                 continue
             lag = session.lag_seconds()
             lag_str = f"{lag:5.1f}s" if lag is not None else "  n/a"
-            print(f"[{time.time()-t0:6.0f}s] state={ctl.state} lag={lag_str} "
+            print(f"[{time.time()-t0:6.0f}s] mode={ctl.cast_mode_active} "
+                  f"state={ctl.state} lag={lag_str} "
                   f"trims={session.trim_count} recasts={session.recast_count}")
         return 0
     except KeyboardInterrupt:
@@ -83,6 +91,8 @@ def main() -> int:
     p_start = sub.add_parser("start", help="start casting to a device or group")
     p_start.add_argument("device", nargs="?", help="friendly name (default: last used)")
     p_start.add_argument("--stream-type", choices=["LIVE", "BUFFERED"])
+    p_start.add_argument("--mode", choices=["auto", "mirror", "http"],
+                         help="cast path (default from config: auto)")
     p_start.add_argument("--no-mute", action="store_true",
                          help="do not mute local output while casting")
     p_start.add_argument("--duration", type=int, default=None,

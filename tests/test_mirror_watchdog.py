@@ -41,6 +41,7 @@ class FakeCapture:
 
 class FakeCast:
     name = "Speaker"
+    app_id = "85CDB22F"
 
     class socket_client:
         host = "192.168.1.5"
@@ -111,6 +112,24 @@ class TestFailureReason(unittest.TestCase):
         s = make_session(sender=FakeSender(checkpoint=-1, last_feedback_at=99.9,
                                            checkpoint_raw_since=0.0))
         self.assertIsNone(s._failure_reason(100.0))
+
+    def test_receiver_app_changed(self):
+        # Someone cast something else to the speaker: app_id no longer ours.
+        s = make_session(sender=FakeSender(checkpoint=500, last_feedback_at=99.9,
+                                           checkpoint_raw_since=99.9))
+        s._app_id = "85CDB22F"
+        s._cast = FakeCast()
+        s._cast.app_id = "CC1AD845"          # a different receiver
+        self.assertEqual(s._failure_reason(100.0), "receiver app changed")
+
+    def test_matching_app_is_healthy(self):
+        s = make_session(sender=FakeSender(checkpoint=500, last_feedback_at=99.9,
+                                           checkpoint_raw_since=99.9))
+        s._app_id = "85CDB22F"               # matches FakeCast.app_id
+        self.assertIsNone(s._failure_reason(100.0))
+
+    def test_format_change_is_a_permanent_reason(self):
+        self.assertIn("capture format changed", mirror.PERMANENT_REASONS)
 
 
 class TestRecovery(unittest.TestCase):
