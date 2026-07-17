@@ -385,6 +385,127 @@ class DeviceIcon(tk.Canvas):
         self.itemconfigure(self._item, image=self._photo)
 
 
+class GlyphButton(tk.Canvas):
+    """Small header icon button: a single Material glyph with a subtle circular
+    state layer on hover. Glyph is settable (e.g. gear <-> back arrow)."""
+
+    def __init__(self, parent, scale: float, glyph: str,
+                 on_click: Callable[[], None], bg=BG):
+        dp = lambda v: round(v * scale)
+        self.D, self._px = dp(36), dp(22)
+        super().__init__(parent, width=self.D, height=self.D, bg=bg,
+                         highlightthickness=0, cursor="hand2")
+        self._ss = render.supersample(scale)
+        self._bg = bg
+        self._on_click = on_click
+        self._glyph = glyph
+        self._hover = False
+        self._item = self.create_image(0, 0, anchor="nw")
+        self._photo = None
+        self.bind("<ButtonRelease-1>", lambda e: self._on_click())
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self._draw()
+
+    def set_glyph(self, glyph: str) -> None:
+        if glyph != self._glyph:
+            self._glyph = glyph
+            self._draw()
+
+    def _set_hover(self, on: bool) -> None:
+        if on != self._hover:
+            self._hover = on
+            self._draw()
+
+    def _draw(self) -> None:
+        D, px, g = self.D, self._px, self._glyph
+        key = ("glyphbtn", g, self._hover, D, self._bg, self._ss)
+
+        def paint(d, k):
+            if self._hover:
+                d.ellipse([0, 0, D * k, D * k], fill=EXIT_HOVER)
+            render.glyph(d, D * k / 2, D * k / 2, g, px * k, SUBTEXT)
+
+        self._photo = render.photo(key, D, D, self._ss, self._bg, paint)
+        self.itemconfigure(self._item, image=self._photo)
+
+
+class _RadioDot(tk.Canvas):
+    """Material radio indicator (filled accent when on)."""
+
+    def __init__(self, parent, scale: float, bg=BG):
+        dp = lambda v: round(v * scale)
+        self.D = self._px = dp(20)
+        super().__init__(parent, width=self.D, height=self.D, bg=bg,
+                         highlightthickness=0, cursor="hand2")
+        self._ss = render.supersample(scale)
+        self._bg = bg
+        self.on = False
+        self._item = self.create_image(0, 0, anchor="nw")
+        self._photo = None
+        self._draw()
+
+    def set_on(self, on: bool) -> None:
+        if on != self.on:
+            self.on = on
+            self._draw()
+
+    def _draw(self) -> None:
+        D, px = self.D, self._px
+        g = "radio_on" if self.on else "radio_off"
+        col = ACCENT if self.on else OUTLINE
+        key = ("radio", self.on, D, self._bg, self._ss)
+        self._photo = render.photo(
+            key, D, D, self._ss, self._bg,
+            lambda d, k: render.glyph(d, D * k / 2, D * k / 2, g, px * k, col))
+        self.itemconfigure(self._item, image=self._photo)
+
+
+class OptionList(tk.Frame):
+    """Vertical single-select list: each row is a radio indicator + a label and
+    an optional caption. on_change(value) fires on a new selection."""
+
+    def __init__(self, parent, scale: float, options, on_change,
+                 caption_wrap: int, bg=BG):
+        # options: iterable of (value, label, caption)
+        from . import fonts
+        super().__init__(parent, bg=bg)
+        dp = lambda v: round(v * scale)
+        self._on_change = on_change
+        self._value = None
+        self._rows: dict[str, _RadioDot] = {}
+        for value, label, caption in options:
+            row = tk.Frame(self, bg=bg, cursor="hand2")
+            row.pack(fill="x", pady=dp(3))
+            dot = _RadioDot(row, scale, bg=bg)
+            dot.pack(side="left", padx=(dp(2), dp(12)), anchor="n")
+            col = tk.Frame(row, bg=bg)
+            col.pack(side="left", fill="x", expand=True)
+            lbl = tk.Label(col, text=label, fg=TEXT, bg=bg, anchor="w",
+                           font=(fonts.FONT, -dp(14)))
+            lbl.pack(fill="x")
+            widgets = [row, dot, col, lbl]
+            if caption:
+                cap = tk.Label(col, text=caption, fg=SUBTEXT, bg=bg, anchor="w",
+                               justify="left", font=(fonts.FONT, -dp(11)),
+                               wraplength=caption_wrap)
+                cap.pack(fill="x")
+                widgets.append(cap)
+            for w in widgets:
+                w.bind("<Button-1>", lambda e, v=value: self._select(v))
+            self._rows[value] = dot
+
+    def set(self, value: str) -> None:
+        self._value = value
+        for v, dot in self._rows.items():
+            dot.set_on(v == value)
+
+    def _select(self, value: str) -> None:
+        if value != self._value:
+            self.set(value)
+            self._on_change(value)
+
+
 class TextButton(tk.Canvas):
     """M3 text button: primary label, pill state layer on hover."""
 

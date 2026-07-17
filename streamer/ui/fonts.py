@@ -35,6 +35,10 @@ ICONS = {
     "stop": chr(0xE047),
     "check": chr(0xE5CA),
     "error": chr(0xE000),
+    "settings": chr(0xE8B8),
+    "arrow_back": chr(0xE5C4),
+    "radio_on": chr(0xE837),
+    "radio_off": chr(0xE836),
 }
 
 _loaded = False

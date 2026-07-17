@@ -35,6 +35,15 @@ while it connects, then becomes a stop button. Each device has a volume slider
 amber connecting, blue casting, red error. Toggle **Start with Windows** and
 **Exit** at the bottom. Launching the app again just re-opens the popover.
 
+The gear in the header opens **Settings**:
+
+- **Latency** — a slider (with Low / Balanced / Safe presets) for the mirror
+  path's target delay. Changing it re-negotiates a live cast on the fly.
+- **Play on** — where audio is audible while casting: *Speakers only* (this PC
+  muted, the default), *This PC only* (speakers silent), *Both*, or *Auto*
+  (your PC's own mute switches between them — mute the PC to send audio to the
+  room, unmute to keep it at your desk).
+
 Config + logs live in `%APPDATA%\desktop-audio-streamer\`.
 
 ## How it works
@@ -64,10 +73,17 @@ extra dependencies). See [docs/mirror.md](docs/mirror.md).
 
 ## Silent-machine behaviour
 
-While casting, the local output endpoint is muted (loopback capture on this
-machine survives mute — verified empirically; it does NOT survive volume-0, so
-keep local volume above zero and let the app mute). A marker file restores the
-endpoint if the app dies without cleanup.
+By default (output mode *Speakers only*) the local output endpoint is muted
+while casting, so only the speakers make sound (loopback capture on this machine
+survives mute — verified empirically; it does NOT survive volume-0, so the app
+mutes and pins volume to 100%). A marker file restores the endpoint if the app
+dies without cleanup. The other output modes leave the PC audible and instead
+feed silence to the cast when the speakers should be quiet, so no device
+volume is ever written for muting.
+
+Note on this machine's driver: the endpoint volume scales the captured signal,
+so only *Speakers only* (which pins 100%) guarantees a full-strength cast; in
+*Both* and *Auto* the cast loudness follows your PC volume.
 
 ## Volume safety
 

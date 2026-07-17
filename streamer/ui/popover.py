@@ -29,8 +29,19 @@ import tkinter.font as tkfont
 from .. import startup
 from . import fonts, render
 from .widgets import (ACCENT, BG, CARD, DIVIDER, ERROR, ERROR_BG, ERROR_FG,
-                      SUBTEXT, TEXT, WARN, DeviceIcon, IconButton, Slider,
-                      TextButton, Toggle, ellipsize)
+                      SUBTEXT, TEXT, WARN, DeviceIcon, GlyphButton, IconButton,
+                      OptionList, Slider, TextButton, Toggle, ellipsize)
+
+# Latency slider maps its 0..100 travel onto this millisecond range.
+DELAY_MIN, DELAY_MAX = 30, 500
+DELAY_PRESETS = (("Low", 50), ("Balanced", 150), ("Safe", 400))
+OUTPUT_OPTIONS = (
+    ("speakers", "Speakers only", "Room hears it, this PC is muted."),
+    ("this_pc", "This PC only", "You hear it here, speakers stay silent."),
+    ("both", "Both", "Speaker volume follows this PC's volume."),
+    ("auto", "Auto", "Your PC mute switches: muted plays the room, "
+     "unmuted keeps it here."),
+)
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +157,7 @@ class Popover:
         self._fade_after: str | None = None
         self._resweep_after: str | None = None
         self._pending_rebuild = False
+        self._view = "devices"          # "devices" | "settings"
         self._last_sig = None
         self._wa = None
         self._anchor: tuple[int, int] | None = None
@@ -229,10 +241,13 @@ class Popover:
         self.header.pack_propagate(False)
         self.header_icon = tk.Label(self.header, bg=BG)
         self.header_icon.pack(side="left", padx=(dp(2), dp(12)))
+        self.gear_btn = GlyphButton(self.header, self.scale, "settings",
+                                    on_click=self._toggle_settings, bg=BG)
+        self.gear_btn.pack(side="right", padx=(dp(8), 0))
         self.status_lbl = tk.Label(
             self.header, text="Not casting", fg=TEXT, bg=BG, anchor="w",
             justify="left", font=self._f_status,
-            wraplength=self.content_w - dp(44))
+            wraplength=self.content_w - dp(44) - dp(44))
         self.status_lbl.pack(side="left", fill="x", expand=True)
         self._set_header_icon("cast", SUBTEXT)
 
@@ -257,8 +272,12 @@ class Popover:
             width=self.content_w - dp(GUTTER))
         self.devices_frame.bind("<Configure>", self._on_devices_configure)
 
-        tk.Frame(f, bg=DIVIDER, height=max(1, dp(1))).pack(
-            fill="x", pady=(dp(12), 0))
+        # Settings view: built once, packed in place of `host` on demand.
+        self.settings_frame = tk.Frame(f, bg=BG)
+        self._build_settings(self.settings_frame, dp)
+
+        self._divider = tk.Frame(f, bg=DIVIDER, height=max(1, dp(1)))
+        self._divider.pack(fill="x", pady=(dp(12), 0))
         footer = tk.Frame(f, bg=BG)
         footer.pack(fill="x", pady=(dp(10), 0))
         tk.Label(footer, text="Start with Windows", fg=TEXT, bg=BG,
@@ -267,6 +286,48 @@ class Popover:
                                      on_change=self._toggle_startup)
         self.startup_toggle.pack(side="left")
         TextButton(footer, self.scale, "Exit", self._exit).pack(side="right")
+        if self._view == "settings":
+            self._show_settings_view()      # survive a DPI rebuild while open
+
+    def _build_settings(self, parent, dp) -> None:
+        """Latency slider (with preset chips) + output-mode list."""
+        cw = self.content_w
+        # -- Latency ----------------------------------------------------------
+        lat_head = tk.Frame(parent, bg=BG)
+        lat_head.pack(fill="x", pady=(dp(2), dp(6)))
+        tk.Label(lat_head, text="Latency", fg=TEXT, bg=BG, anchor="w",
+                 font=(fonts.MEDIUM, -dp(15))).pack(side="left", padx=dp(2))
+        self.lat_value = tk.Label(lat_head, text="", fg=ACCENT, bg=BG,
+                                  anchor="e", font=(fonts.MEDIUM, -dp(14)))
+        self.lat_value.pack(side="right", padx=dp(2))
+        self.lat_slider = Slider(
+            parent, self.scale, width=cw - dp(4),
+            on_change=self._latency_change, on_release=self._latency_release,
+            bg=BG)
+        self.lat_slider.pack(fill="x", pady=(0, dp(4)))
+        chips = tk.Frame(parent, bg=BG)
+        chips.pack(fill="x", pady=(0, dp(4)))
+        for label, ms in DELAY_PRESETS:
+            chip = tk.Label(chips, text=label, fg=ACCENT, bg=BG, cursor="hand2",
+                            font=(fonts.MEDIUM, -dp(12)))
+            chip.pack(side="left", padx=dp(8))
+            chip.bind("<Button-1>", lambda e, m=ms: self._latency_preset(m))
+        self.lat_note = tk.Label(parent, text="", fg=SUBTEXT, bg=BG, anchor="w",
+                                 justify="left", font=(fonts.FONT, -dp(11)),
+                                 wraplength=cw - dp(4))
+        self.lat_note.pack(fill="x", pady=(0, dp(2)))
+
+        tk.Frame(parent, bg=DIVIDER, height=max(1, dp(1))).pack(
+            fill="x", pady=(dp(12), dp(12)))
+
+        # -- Output -----------------------------------------------------------
+        tk.Label(parent, text="Play on", fg=TEXT, bg=BG, anchor="w",
+                 font=(fonts.MEDIUM, -dp(15))).pack(fill="x", padx=dp(2),
+                                                    pady=(0, dp(6)))
+        self.output_list = OptionList(
+            parent, self.scale, OUTPUT_OPTIONS, on_change=self._output_change,
+            caption_wrap=cw - dp(34), bg=BG)
+        self.output_list.pack(fill="x")
 
     def _set_header_icon(self, name: str, color: str) -> None:
         dp = self.dp
@@ -327,6 +388,81 @@ class Popover:
         if self._visible:
             self._resize()
 
+    # ---- settings view -----------------------------------------------------
+
+    def _toggle_settings(self) -> None:
+        if self._view == "settings":
+            self._show_devices_view()
+        else:
+            self._show_settings_view()
+
+    def _show_settings_view(self) -> None:
+        self._view = "settings"
+        self.gear_btn.set_glyph("arrow_back")
+        self.host.pack_forget()
+        self.settings_frame.pack(fill="x", pady=(self.dp(4), 0),
+                                 before=self._divider)
+        self._refresh_settings_controls()
+        if self._visible:
+            self._resize()
+
+    def _show_devices_view(self) -> None:
+        self._view = "devices"
+        self.gear_btn.set_glyph("settings")
+        self.settings_frame.pack_forget()
+        self.host.pack(fill="both", expand=True, pady=(self.dp(4), 0),
+                       before=self._divider)
+        if self._pending_rebuild and not self._any_dragging():
+            self._pending_rebuild = False
+            self._rebuild_rows()
+            self._resweep()
+        if self._visible:
+            self._resize()
+
+    def _refresh_settings_controls(self) -> None:
+        ms = int(self.ctl.cfg.get("mirror_target_delay_ms", 400))
+        self.lat_slider.set_value(self._ms_to_slider(ms))
+        self.lat_value.configure(text=f"{ms} ms")
+        self.output_list.set(self.ctl.cfg.get("output_mode", "speakers"))
+        self._update_latency_note()
+
+    def _update_latency_note(self) -> None:
+        if self.ctl.cfg.get("cast_mode") == "http":
+            note = ("Cast mode is set to standard; latency tuning applies to "
+                    "the low-latency path only.")
+        elif self.ctl.session is not None and self.ctl.cast_mode_active == "http":
+            note = ("This speaker is on the standard path; tuning takes effect "
+                    "on low-latency casts.")
+        else:
+            note = "Lower is snappier; very low can stutter on busy Wi-Fi."
+        self.lat_note.configure(text=note)
+
+    @staticmethod
+    def _ms_to_slider(ms: int) -> float:
+        return max(0.0, min(100.0,
+                            (ms - DELAY_MIN) / (DELAY_MAX - DELAY_MIN) * 100))
+
+    @staticmethod
+    def _slider_to_ms(v: float) -> int:
+        ms = DELAY_MIN + (DELAY_MAX - DELAY_MIN) * v / 100
+        return int(round(ms / 5.0) * 5)      # snap to 5 ms
+
+    def _latency_change(self, v: float) -> None:
+        self.lat_value.configure(text=f"{self._slider_to_ms(v)} ms")
+
+    def _latency_release(self, v: float) -> None:
+        ms = self._slider_to_ms(v)
+        self.lat_value.configure(text=f"{ms} ms")
+        self.ctl.set_target_delay(ms)
+
+    def _latency_preset(self, ms: int) -> None:
+        self.lat_slider.set_value(self._ms_to_slider(ms))
+        self.lat_value.configure(text=f"{ms} ms")
+        self.ctl.set_target_delay(ms)
+
+    def _output_change(self, mode: str) -> None:
+        self.ctl.set_output_mode(mode)
+
     # ---- device cards ------------------------------------------------------
 
     def _any_dragging(self) -> bool:
@@ -345,8 +481,8 @@ class Popover:
         sig = self._devices_sig()
         if sig == self._dev_sig and (self._rows or not sig):
             return
-        if self._any_dragging():
-            self._pending_rebuild = True
+        if self._view == "settings" or self._any_dragging():
+            self._pending_rebuild = True     # rebuild when the list returns
             return
         self._rebuild_rows()
         if self._visible:
@@ -626,6 +762,12 @@ class Popover:
         self._cancel_fade()
         if s != self.scale:
             self._build_static(s)
+        if self._view == "settings":        # always open on the device list
+            self._view = "devices"
+            self.gear_btn.set_glyph("settings")
+            self.settings_frame.pack_forget()
+            self.host.pack(fill="both", expand=True, pady=(self.dp(4), 0),
+                           before=self._divider)
         self._rebuild_rows()
         self.startup_toggle.set(startup.is_enabled())
         self._resweep()
@@ -686,13 +828,16 @@ class Popover:
     def _resize(self) -> None:
         dp = self.dp
         self.frame.update_idletasks()
-        dev_h = self.devices_frame.winfo_reqheight()
-        self.scroll_canvas.configure(height=dev_h)
+        devices_view = self._view == "devices"
+        dev_h = 0
+        if devices_view:
+            dev_h = self.devices_frame.winfo_reqheight()
+            self.scroll_canvas.configure(height=dev_h)
         self.frame.update_idletasks()
         total = self.frame.winfo_reqheight() + 2 * dp(14)
         left, top, right, bottom = self._wa or (0, 0, 1920, 1040)
         cap = (bottom - top) - dp(24)
-        self._scrollable = total > cap
+        self._scrollable = devices_view and total > cap
         if self._scrollable:
             self.scroll_canvas.configure(
                 height=max(dp(120), dev_h - (total - cap)))
