@@ -36,11 +36,10 @@ from .widgets import (ACCENT, BG, CARD, DIVIDER, ERROR, ERROR_BG, ERROR_FG,
 DELAY_MIN, DELAY_MAX = 30, 500
 DELAY_PRESETS = (("Low", 50), ("Balanced", 150), ("Safe", 400))
 OUTPUT_OPTIONS = (
-    ("speakers", "Speakers only", "Room hears it, this PC is muted."),
-    ("this_pc", "This PC only", "You hear it here, speakers stay silent."),
+    ("speakers", "Speakers only", "This PC will be muted."),
+    ("this_pc", "This PC only", "Speakers will be muted."),
     ("both", "Both", "Speaker volume follows this PC's volume."),
-    ("auto", "Auto", "Your PC mute switches: muted plays the room, "
-     "unmuted keeps it here."),
+    ("auto", "Auto", "Unmuting this PC will mute your speakers, and vice versa."),
 )
 
 log = logging.getLogger(__name__)
@@ -286,32 +285,31 @@ class Popover:
             self._show_settings_view()      # survive a DPI rebuild while open
 
     def _build_settings(self, parent, dp) -> None:
-        """Latency slider (with preset chips) + output-mode list."""
+        """Latency slider (with preset buttons), output-mode list, startup."""
         cw = self.content_w
         # -- Latency ----------------------------------------------------------
         lat_head = tk.Frame(parent, bg=BG)
-        lat_head.pack(fill="x", pady=(dp(2), dp(6)))
+        lat_head.pack(fill="x", pady=(dp(2), dp(4)))
         tk.Label(lat_head, text="Latency", fg=TEXT, bg=BG, anchor="w",
                  font=(fonts.MEDIUM, -dp(15))).pack(side="left", padx=dp(2))
         self.lat_value = tk.Label(lat_head, text="", fg=ACCENT, bg=BG,
                                   anchor="e", font=(fonts.MEDIUM, -dp(14)))
         self.lat_value.pack(side="right", padx=dp(2))
+        self.lat_note = tk.Label(parent, text="", fg=SUBTEXT, bg=BG, anchor="w",
+                                 justify="left", font=(fonts.FONT, -dp(11)),
+                                 wraplength=cw - dp(4))
+        self.lat_note.pack(fill="x", padx=dp(2), pady=(0, dp(8)))
         self.lat_slider = Slider(
             parent, self.scale, width=cw - dp(4),
             on_change=self._latency_change, on_release=self._latency_release,
             bg=BG)
         self.lat_slider.pack(fill="x", pady=(0, dp(4)))
         chips = tk.Frame(parent, bg=BG)
-        chips.pack(fill="x", pady=(0, dp(4)))
+        chips.pack(fill="x")
         for label, ms in DELAY_PRESETS:
-            chip = tk.Label(chips, text=label, fg=ACCENT, bg=BG, cursor="hand2",
-                            font=(fonts.MEDIUM, -dp(12)))
-            chip.pack(side="left", padx=dp(8))
-            chip.bind("<Button-1>", lambda e, m=ms: self._latency_preset(m))
-        self.lat_note = tk.Label(parent, text="", fg=SUBTEXT, bg=BG, anchor="w",
-                                 justify="left", font=(fonts.FONT, -dp(11)),
-                                 wraplength=cw - dp(4))
-        self.lat_note.pack(fill="x", pady=(0, dp(2)))
+            TextButton(chips, self.scale, label,
+                       lambda m=ms: self._latency_preset(m), bg=BG
+                       ).pack(side="left", padx=(0, dp(4)))
 
         tk.Frame(parent, bg=DIVIDER, height=max(1, dp(1))).pack(
             fill="x", pady=(dp(12), dp(12)))
@@ -325,19 +323,22 @@ class Popover:
             caption_wrap=cw - dp(34), bg=BG)
         self.output_list.pack(fill="x")
 
-        # Absorb any slack (the settings view adopts the taller device-pane
-        # height) so the Start-with-Windows row sits just above the footer
-        # rather than leaving a void in the middle of the panel.
-        tk.Frame(parent, bg=BG).pack(fill="both", expand=True)
         tk.Frame(parent, bg=DIVIDER, height=max(1, dp(1))).pack(
-            fill="x", pady=(0, dp(12)))
+            fill="x", pady=(dp(12), dp(12)))
+
+        # -- Startup ----------------------------------------------------------
+        tk.Label(parent, text="Startup", fg=TEXT, bg=BG, anchor="w",
+                 font=(fonts.MEDIUM, -dp(15))).pack(fill="x", padx=dp(2),
+                                                    pady=(0, dp(6)))
         startup_row = tk.Frame(parent, bg=BG)
         startup_row.pack(fill="x")
-        tk.Label(startup_row, text="Start with Windows", fg=TEXT, bg=BG,
+        tk.Label(startup_row, text="Launch on startup", fg=TEXT, bg=BG,
                  font=(fonts.FONT, -dp(14))).pack(side="left", padx=(dp(2), dp(12)))
         self.startup_toggle = Toggle(startup_row, self.scale,
                                      on_change=self._toggle_startup, bg=BG)
         self.startup_toggle.pack(side="left")
+        # settings_frame is packed expand=True, so its slack sits below here and
+        # the footer (Exit) stays pinned at the window bottom.
 
     def _set_header_icon(self, name: str, color: str) -> None:
         dp = self.dp
@@ -447,7 +448,8 @@ class Popover:
             note = ("This speaker is on the standard path; tuning takes effect "
                     "on low-latency casts.")
         else:
-            note = "Lower is snappier; very low can stutter on busy Wi-Fi."
+            note = ("Lower latency reduces the playback gap between your "
+                    "speakers and your PC, but may cause stuttering on busy WiFi.")
         self.lat_note.configure(text=note)
 
     @staticmethod
