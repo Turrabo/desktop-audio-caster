@@ -280,11 +280,6 @@ class Popover:
         self._divider.pack(fill="x", pady=(dp(12), 0))
         footer = tk.Frame(f, bg=BG)
         footer.pack(fill="x", pady=(dp(10), 0))
-        tk.Label(footer, text="Start with Windows", fg=TEXT, bg=BG,
-                 font=(fonts.FONT, -dp(14))).pack(side="left", padx=(dp(2), dp(12)))
-        self.startup_toggle = Toggle(footer, self.scale,
-                                     on_change=self._toggle_startup)
-        self.startup_toggle.pack(side="left")
         TextButton(footer, self.scale, "Exit", self._exit).pack(side="right")
         if self._view == "settings":
             self._show_settings_view()      # survive a DPI rebuild while open
@@ -328,6 +323,16 @@ class Popover:
             parent, self.scale, OUTPUT_OPTIONS, on_change=self._output_change,
             caption_wrap=cw - dp(34), bg=BG)
         self.output_list.pack(fill="x")
+
+        tk.Frame(parent, bg=DIVIDER, height=max(1, dp(1))).pack(
+            fill="x", pady=(dp(14), dp(12)))
+        startup_row = tk.Frame(parent, bg=BG)
+        startup_row.pack(fill="x")
+        tk.Label(startup_row, text="Start with Windows", fg=TEXT, bg=BG,
+                 font=(fonts.FONT, -dp(14))).pack(side="left", padx=(dp(2), dp(12)))
+        self.startup_toggle = Toggle(startup_row, self.scale,
+                                     on_change=self._toggle_startup, bg=BG)
+        self.startup_toggle.pack(side="left")
 
     def _set_header_icon(self, name: str, color: str) -> None:
         dp = self.dp
@@ -424,6 +429,7 @@ class Popover:
         self.lat_slider.set_value(self._ms_to_slider(ms))
         self.lat_value.configure(text=f"{ms} ms")
         self.output_list.set(self.ctl.cfg.get("output_mode", "speakers"))
+        self.startup_toggle.set(startup.is_enabled())
         self._update_latency_note()
 
     def _update_latency_note(self) -> None:
@@ -769,7 +775,6 @@ class Popover:
             self.host.pack(fill="both", expand=True, pady=(self.dp(4), 0),
                            before=self._divider)
         self._rebuild_rows()
-        self.startup_toggle.set(startup.is_enabled())
         self._resweep()
         if self._resweep_after is None:
             self._resweep_after = self.win.after(30000, self._periodic_resweep)
