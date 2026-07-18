@@ -162,6 +162,7 @@ class Popover:
         self._wa = None
         self._anchor: tuple[int, int] | None = None
         self._h = 0
+        self._pane_h = 0            # device-view height; settings adopts it
         self._scrollable = False
         self._wacc = self._sacc = 0.0
         try:
@@ -324,8 +325,12 @@ class Popover:
             caption_wrap=cw - dp(34), bg=BG)
         self.output_list.pack(fill="x")
 
+        # Absorb any slack (the settings view adopts the taller device-pane
+        # height) so the Start-with-Windows row sits just above the footer
+        # rather than leaving a void in the middle of the panel.
+        tk.Frame(parent, bg=BG).pack(fill="both", expand=True)
         tk.Frame(parent, bg=DIVIDER, height=max(1, dp(1))).pack(
-            fill="x", pady=(dp(14), dp(12)))
+            fill="x", pady=(0, dp(12)))
         startup_row = tk.Frame(parent, bg=BG)
         startup_row.pack(fill="x")
         tk.Label(startup_row, text="Start with Windows", fg=TEXT, bg=BG,
@@ -405,7 +410,9 @@ class Popover:
         self._view = "settings"
         self.gear_btn.set_glyph("arrow_back")
         self.host.pack_forget()
-        self.settings_frame.pack(fill="x", pady=(self.dp(4), 0),
+        # expand so, when the device pane is taller, the slack sits below the
+        # controls and the footer stays pinned at the bottom (no gap under Exit)
+        self.settings_frame.pack(fill="both", expand=True, pady=(self.dp(4), 0),
                                  before=self._divider)
         self._refresh_settings_controls()
         if self._visible:
@@ -833,20 +840,26 @@ class Popover:
     def _resize(self) -> None:
         dp = self.dp
         self.frame.update_idletasks()
-        devices_view = self._view == "devices"
-        dev_h = 0
-        if devices_view:
-            dev_h = self.devices_frame.winfo_reqheight()
-            self.scroll_canvas.configure(height=dev_h)
-        self.frame.update_idletasks()
-        total = self.frame.winfo_reqheight() + 2 * dp(14)
         left, top, right, bottom = self._wa or (0, 0, 1920, 1040)
         cap = (bottom - top) - dp(24)
-        self._scrollable = devices_view and total > cap
-        if self._scrollable:
-            self.scroll_canvas.configure(
-                height=max(dp(120), dev_h - (total - cap)))
-            total = cap
+        if self._view == "devices":
+            # Fit the device list, capped at the viewport (scroll past that).
+            dev_h = self.devices_frame.winfo_reqheight()
+            self.scroll_canvas.configure(height=dev_h)
+            self.frame.update_idletasks()
+            total = self.frame.winfo_reqheight() + 2 * dp(14)
+            self._scrollable = total > cap
+            if self._scrollable:
+                self.scroll_canvas.configure(
+                    height=max(dp(120), dev_h - (total - cap)))
+                total = cap
+            self._pane_h = total          # the settings view adopts this
+        else:
+            # Settings adopts the device-pane height so toggling never resizes;
+            # only grow (capped) in the rare case settings genuinely needs more.
+            settings_total = self.frame.winfo_reqheight() + 2 * dp(14)
+            total = min(cap, max(self._pane_h or settings_total, settings_total))
+            self._scrollable = False
         self._h = total
         if self._anchor is not None:
             # Height changed while visible (banner, device list): keep the
