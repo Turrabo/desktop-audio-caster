@@ -1,18 +1,30 @@
-"""WASAPI loopback capture with format probing and self-healing.
+"""Desktop audio capture. Two backends behind one interface (open_capture):
 
-Delivers 16-bit PCM at the device's native rate/channels into a callback.
-Health: consecutive read failures flip ``healthy`` False and trigger reopen
-attempts; the caster's watchdog reads ``healthy`` and restart_count.
+- ProcessLoopbackCapture: whole-system capture BEFORE the endpoint volume/mute
+  (Windows 10 build 20348+), so the cast is decoupled from the PC's volume/mute.
+  Fixed 48 kHz stereo 16-bit; not tied to a render device.
+- LoopbackCapture: WASAPI endpoint loopback (the fallback). 16-bit PCM at the
+  device's native rate; the endpoint VOLUME scales it, so casting couples to the
+  PC volume (hence the mute-and-pin machinery in localmute).
+
+Both deliver 16-bit PCM into a callback and expose .format / .healthy /
+.restart_count / .couples_volume. Health: read failures flip ``healthy`` False
+and trigger recovery; the caster's watchdog reads ``healthy``.
 """
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
 
+import comtypes
 import pyaudiowpatch as pyaudio
+
+from . import _proc_loopback as _pl
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +47,8 @@ class CaptureFormat:
 
 
 class LoopbackCapture:
+    couples_volume = True    # endpoint volume scales this capture (see localmute)
+
     def __init__(self, on_data: Callable[[bytes], None], device_hint: str | None = None):
         self._on_data = on_data
         self._device_hint = device_hint
@@ -194,3 +208,192 @@ class LoopbackCapture:
                 pass
             self._stream = None
         self._pa.terminate()
+
+
+class ProcessLoopbackCapture:
+    """Whole-system capture before the endpoint volume/mute (decoupled). The
+    capture MTA thread owns the ENTIRE COM lifecycle - CoUninitialize is
+    thread-affine, so all COM teardown runs in the thread's own finally, and
+    stop() only signals + joins."""
+
+    couples_volume = False
+
+    def __init__(self, on_data: Callable[[bytes], None], device_hint=None):
+        self._on_data = on_data
+        self.format = CaptureFormat(_pl.CAPTURE_RATE, _pl.CAPTURE_CHANNELS,
+                                    _pl.CAPTURE_SAMPWIDTH)
+        self.healthy = False
+        self.restart_count = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._ready_ok = False
+        self._ready_exc: Exception | None = None
+        self._client = None
+        self._capture = None
+        self._evt = None
+        self._com_started = False
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._ready.clear()
+        self._ready_ok = False
+        self._ready_exc = None
+        self._thread = threading.Thread(target=self._run, name="proc-capture",
+                                        daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=10):
+            self._stop.set()
+            raise TimeoutError("process-loopback capture did not start in 10 s")
+        if not self._ready_ok:
+            raise self._ready_exc or OSError("process-loopback capture failed")
+
+    def _run(self) -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            self._com_started = True
+            _pl.mf_startup()
+            self._activate()
+            self._ready_ok = True
+        except Exception as e:
+            # Re-raise a COPY on the caller thread, never the live exception:
+            # its traceback pins this frame's locals (the COM interfaces), which
+            # would then be released after CoUninitialize, on another thread.
+            self._ready_exc = OSError(
+                "process-loopback activation failed: %s: %s"
+                % (type(e).__name__, e))
+            self._ready.set()
+            self._teardown_com()
+            return
+        self._ready.set()
+        try:
+            self._read_loop()
+        except Exception:
+            # Nothing above catches this, and teardown MUST still run on this
+            # thread (CoUninitialize is thread-affine).
+            log.exception("proc capture thread died")
+        finally:
+            if not self._stop.is_set():
+                # Died on its own rather than being stopped: mark unhealthy so
+                # the caster watchdog tears down and re-casts.
+                self.healthy = False
+            self._teardown_com()
+
+    def _activate(self) -> None:
+        self._client = _pl.activate_process_loopback(os.getpid())
+        wfx = _pl.capture_waveformat()
+        self._client.Initialize(
+            _pl.AUDCLNT_SHAREMODE_SHARED,
+            _pl.AUDCLNT_STREAMFLAGS_LOOPBACK | _pl.AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            2_000_000, 0, ctypes.byref(wfx), None)
+        self._evt = _pl.create_event()
+        self._client.SetEventHandle(self._evt)
+        unk = self._client.GetService(ctypes.byref(_pl.IID_IAudioCaptureClient))
+        self._capture = unk.QueryInterface(_pl.IAudioCaptureClient)
+        self._client.Start()
+        self.healthy = True
+
+    def _read_loop(self) -> None:
+        blk = self.format.frame_bytes
+        errors = 0
+        while not self._stop.is_set():
+            _pl.wait_event(self._evt, 100)     # timeout lets us see _stop
+            try:
+                n = self._capture.GetNextPacketSize()
+                while n:
+                    data, frames, flags, _dp, _qp = self._capture.GetBuffer()
+                    try:
+                        if not (flags & _pl.AUDCLNT_BUFFERFLAGS_SILENT):
+                            # one copy of the whole buffer while it is still
+                            # ours; the pacer fills silence gaps from its clock
+                            self._on_data(ctypes.string_at(data, frames * blk))
+                    finally:
+                        # Must always release, even if on_data raised, or the
+                        # next GetBuffer fails AUDCLNT_E_OUT_OF_ORDER.
+                        self._capture.ReleaseBuffer(frames)
+                    n = self._capture.GetNextPacketSize()
+                errors = 0
+            except Exception as e:
+                # Broad by necessity: comtypes raises COMError on a failed
+                # HRESULT and COMError is NOT an OSError subclass, so the
+                # failures this exists for (device invalidated on sleep/resume,
+                # audio service restarted) would slip straight through a
+                # narrower catch and kill the thread silently.
+                errors += 1
+                log.warning("proc capture read error (%d): %s", errors, e)
+                if errors >= 5:
+                    if self._reactivate():
+                        errors = 0
+                    else:
+                        self.healthy = False
+                        return
+
+    def _reactivate(self) -> bool:
+        """Windows audio service restarts etc.: re-activate on this thread."""
+        self._release_stream()
+        try:
+            if self._stop.wait(1.0):      # settle, but abandon on stop()
+                return False
+            self._activate()
+            self.restart_count += 1
+            log.info("proc capture re-activated (restart #%d)", self.restart_count)
+            return True
+        except Exception as e:
+            log.warning("proc capture re-activation failed: %s", e)
+            return False
+
+    def _release_stream(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.Stop()
+            except Exception:
+                pass
+        self._capture = None      # comtypes Releases on this thread when dropped
+        self._client = None
+        if self._evt:
+            _pl.close_event(self._evt)
+            self._evt = None
+
+    def _teardown_com(self) -> None:
+        self._release_stream()
+        if self._com_started:
+            _pl.mf_shutdown()
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+            self._com_started = False
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            # Long enough to outlast a reactivation in flight (1 s settle, which
+            # stop() short-circuits, plus a 5 s activation timeout); a shorter
+            # join would routinely hit the leak path below.
+            self._thread.join(timeout=8)
+            if self._thread.is_alive():
+                log.warning("proc capture thread did not exit; leaking COM "
+                            "instead of an off-thread teardown")
+
+
+def open_capture(on_data: Callable[[bytes], None], device_hint: str | None = None):
+    """Pick a capture backend, returning it already started (so its format is
+    known to the caller). A pinned capture device (device_hint) forces the
+    endpoint path, which honours it; otherwise use process loopback when
+    available (decoupled from volume), falling back to endpoint. Any activation
+    failure falls back rather than erroring the cast.
+
+    The first call also pays for supported()'s trial activation, so process
+    loopback is activated twice on the first cast of a session; both are cheap
+    on a machine that supports it, and supported() caches thereafter."""
+    if device_hint is None and _pl.supported():
+        try:
+            cap = ProcessLoopbackCapture(on_data)
+            cap.start()
+            log.info("using process-loopback capture (volume-decoupled)")
+            return cap
+        except Exception as e:
+            log.warning("process-loopback capture failed (%s); using endpoint", e)
+    cap = LoopbackCapture(on_data, device_hint)
+    cap.start()
+    return cap

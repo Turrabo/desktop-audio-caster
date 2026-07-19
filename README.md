@@ -71,19 +71,33 @@ even though mirroring rides an undocumented protocol Google could change; set
 [libopus](https://opus-codec.org/); encryption via Windows' own crypto (no
 extra dependencies). See [docs/mirror.md](docs/mirror.md).
 
+## How audio is captured
+
+Two capture backends, chosen automatically at cast start:
+
+- **Process loopback (default on Windows 10 build 20348+)** — captures the whole
+  system mix *before* the endpoint volume/mute stage, so the cast is decoupled
+  from the PC: muting or turning down the PC leaves the cast at full strength.
+  Always 48 kHz stereo, and not tied to a render device (a default-device switch
+  doesn't break it). A one-off trial activation at startup decides availability;
+  anything older or a failed activation falls back to the next path.
+- **Endpoint loopback (fallback)** — WASAPI loopback off the render endpoint, at
+  the device's native rate. On this machine's driver the endpoint volume scales
+  the captured signal (volume 0 = dead capture), so this path pins the endpoint
+  volume to 100% while casting and the cast loudness in *Both* / *Auto* follows
+  the PC volume.
+
 ## Silent-machine behaviour
 
 By default (output mode *Speakers only*) the local output endpoint is muted
-while casting, so only the speakers make sound (loopback capture on this machine
-survives mute — verified empirically; it does NOT survive volume-0, so the app
-mutes and pins volume to 100%). A marker file restores the endpoint if the app
-dies without cleanup. The other output modes leave the PC audible and instead
-feed silence to the cast when the speakers should be quiet, so no device
-volume is ever written for muting.
-
-Note on this machine's driver: the endpoint volume scales the captured signal,
-so only *Speakers only* (which pins 100%) guarantees a full-strength cast; in
-*Both* and *Auto* the cast loudness follows your PC volume.
+while casting, so only the speakers make sound, and the app re-asserts that mute
+while the cast runs (a stray mute-key press won't un-silence the room). On the
+process-loopback path that's all it does — the cast is decoupled, so your PC
+volume is left alone. On the endpoint-loopback fallback it also pins the volume
+to 100% (the capture would otherwise be scaled by it). A marker file restores
+the endpoint if the app dies without cleanup. The other output modes leave the
+PC audible and instead feed silence to the cast when the speakers should be
+quiet, so no device volume is ever written for muting.
 
 ## Volume safety
 

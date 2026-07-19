@@ -13,21 +13,24 @@ class FakeMute:
     def __init__(self):
         self.engaged = False
         self.releases = 0
+        self.pin = None
 
-    def engage(self):
+    def engage(self, pin=True):
         self.engaged = True
+        self.pin = pin
 
     def release(self):
         self.engaged = False
         self.releases += 1
 
 
-def make_ctl():
+def make_ctl(couples=True):
     ctl = appctl.AppController.__new__(appctl.AppController)      # skip __init__
     ctl.cfg = {"output_mode": "speakers"}
     ctl.mute = FakeMute()
     ctl._cast_silenced = False
     ctl._output_mode = "speakers"
+    ctl._couples = couples
     ctl._auto_stop = None
     ctl.cast_target = "Kitchen"
     ctl.session = object()
@@ -48,6 +51,16 @@ class TestApplyOutputMode(unittest.TestCase):
         ctl._apply_output_mode("speakers")
         self.assertTrue(ctl.mute.engaged)
         self.assertFalse(ctl._cast_silenced)
+
+    def test_speakers_pins_volume_when_capture_couples(self):
+        ctl = make_ctl(couples=True)         # endpoint loopback path
+        ctl._apply_output_mode("speakers")
+        self.assertTrue(ctl.mute.pin)
+
+    def test_speakers_no_pin_when_capture_decoupled(self):
+        ctl = make_ctl(couples=False)        # process-loopback path
+        ctl._apply_output_mode("speakers")
+        self.assertFalse(ctl.mute.pin)
 
     def test_this_pc_unmutes_and_silences_cast(self):
         ctl = make_ctl()

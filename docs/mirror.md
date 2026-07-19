@@ -23,7 +23,7 @@ ineligible); `http` pins the original path and is the kill switch.
 ## Pipeline
 
 ```
-capture.py (WASAPI loopback, 48 kHz s16) -> pacer.py (single clock, unchanged)
+capture.py (process or endpoint loopback, s16) -> pacer.py (single clock)
    -> AppController._pacer_sink fan-out:
         server.feed  (HTTP path; a no-op with no clients, e.g. while mirroring)
         MirrorSession.feed -> MirrorSink
@@ -61,7 +61,9 @@ cross-checked against [chromium/openscreen](https://github.com/chromium/openscre
 Mirror requires 48 kHz stereo 16-bit capture (the fixed Opus config; no
 resampler yet) and a loadable `opus.dll`. The check is `mirror.eligible_format`
 + `AppController._mirror_available`; anything else routes to HTTP with a log
-line. 48 kHz is the usual Windows shared-mode default.
+line. The process-loopback capture path always delivers 48 kHz, so mirror is
+always eligible there; the endpoint-loopback fallback uses the device's native
+rate, which is 48 kHz by the usual Windows shared-mode default.
 
 ## Reliability and fallback
 

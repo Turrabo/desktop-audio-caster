@@ -17,7 +17,7 @@ import threading
 import time
 
 from . import config as cfg_mod
-from .capture import LoopbackCapture
+from .capture import open_capture
 from .caster import CastSession, Discovery
 from .localmute import LocalMute, recover_from_crash
 from .pacer import Pacer
@@ -42,7 +42,10 @@ class AppController:
         self.state = "DISCOVERING"
         self.state_detail: str | None = None
         self.discovery = Discovery(on_change=self._on_devices_changed)
-        self.capture: LoopbackCapture | None = None
+        self.capture = None
+        # Whether the live capture couples the cast to endpoint volume (endpoint
+        # loopback does; process loopback does not). Gates the mute layer's pin.
+        self._couples = True
         self.pacer: Pacer | None = None
         self.server: StreamServer | None = None
         self.session = None            # CastSession or MirrorSession
@@ -109,6 +112,13 @@ class AppController:
     def stop_cast(self) -> None:
         self.enqueue(self._do_stop)
 
+    def _feed_pacer(self, data: bytes) -> None:
+        """Capture callback. The capture starts before the pacer is built (the
+        factory activates + starts inside open_capture); drop until it exists."""
+        p = self.pacer
+        if p is not None:
+            p.feed(data)
+
     def _pacer_sink(self, chunk: bytes) -> None:
         """Fan-out from the single pacer clock: the HTTP server always (a cheap
         no-op when it has no clients, e.g. while mirroring) plus the mirror
@@ -141,33 +151,66 @@ class AppController:
             self._do_stop()  # switch target = stop + start, same worker
 
         self._set_state("CONNECTING", name)
-        self.capture = LoopbackCapture(on_data=lambda d: self.pacer.feed(d),
-                                       device_hint=self.cfg["capture_device"])
-        self.server = StreamServer(self.capture.format, self.cfg["port"])
-        self.pacer = Pacer(self.capture.format, sink=self._pacer_sink)
-        self.server.start()
-        self.pacer.start()
-        self.capture.start()
+        # open_capture makes the backend choice and returns the capture already
+        # STARTED, so its format is known here. It feeds at once; _feed_pacer
+        # drops until the pacer is built a few lines down.
+        self.capture = open_capture(on_data=self._feed_pacer,
+                                    device_hint=self.cfg["capture_device"])
+        self._couples = self.capture.couples_volume
+        try:
+            self.server = StreamServer(self.capture.format, self.cfg["port"])
+            self.pacer = Pacer(self.capture.format, sink=self._pacer_sink)
+            self.server.start()
+            self.pacer.start()
 
-        safe_cast = self.discovery.connect(name)
-        self.cast_target = safe_cast.name
-        self._apply_output_mode(self.cfg["output_mode"])
+            safe_cast = self.discovery.connect(name)
+            self.cast_target = safe_cast.name
+            self._apply_output_mode(self.cfg["output_mode"])
 
-        can_mirror, why = self._mirror_available(self.capture.format)
-        if self.cfg["cast_mode"] == "mirror" and not can_mirror:
-            log.warning("cast_mode=mirror but ineligible (%s); using HTTP", why)
-        started_mirror = can_mirror and self._try_start_mirror(safe_cast)
-        if started_mirror:
-            self.cast_mode_active = "mirror"
-        else:
-            if can_mirror:
-                # the failed mirror attempt disconnected the cast; reconnect
-                safe_cast = self.discovery.connect(name)
-            self._start_http(safe_cast)
-            self.cast_mode_active = "http"
+            can_mirror, why = self._mirror_available(self.capture.format)
+            if self.cfg["cast_mode"] == "mirror" and not can_mirror:
+                log.warning("cast_mode=mirror but ineligible (%s); using HTTP", why)
+            started_mirror = can_mirror and self._try_start_mirror(safe_cast)
+            if started_mirror:
+                self.cast_mode_active = "mirror"
+            else:
+                if can_mirror:
+                    # the failed mirror attempt disconnected the cast; reconnect
+                    safe_cast = self.discovery.connect(name)
+                self._start_http(safe_cast)
+                self.cast_mode_active = "http"
 
-        self.cfg["last_device"] = safe_cast.name
-        cfg_mod.save(self.cfg)
+            self.cfg["last_device"] = safe_cast.name
+            cfg_mod.save(self.cfg)
+        except Exception:
+            # The capture is already RUNNING, so a failure here (port bind,
+            # connect, ...) must tear it down. The ops worker only sets ERROR;
+            # without this the capture survives as an orphan still bound to
+            # _feed_pacer and would feed the NEXT session's pacer alongside its
+            # own capture - two captures interleaving into one clock.
+            self._abort_partial_start()
+            raise
+
+    def _abort_partial_start(self) -> None:
+        """Release whatever _do_start managed to build before it failed."""
+        self._stop_auto_monitor()
+        self.mute.release()
+        self._cast_silenced = False
+        if self.session is not None:
+            try:
+                self.session.stop()
+            except Exception as e:
+                log.debug("partial-start session stop: %s", e)
+            self.session = None
+        for obj in (self.capture, self.pacer, self.server):
+            if obj is not None:
+                try:
+                    obj.stop()
+                except Exception as e:
+                    log.debug("partial-start teardown: %s", e)
+        self.capture = self.pacer = self.server = None
+        self._mirror_feed = None
+        self.cast_target = None
 
     def _try_start_mirror(self, safe_cast) -> bool:
         """Attempt a mirror session. On any start-time failure, tear it down and
@@ -240,8 +283,11 @@ class AppController:
         from . import localmute
         self._output_mode = mode
         self._stop_auto_monitor()
-        if mode == "speakers":            # PC muted+pinned, full-strength cast
-            self.mute.engage()
+        if mode == "speakers":            # PC muted, full-strength cast
+            # Pin the volume too only when the capture couples to it (endpoint
+            # loopback); the process-loopback path is decoupled, so muting alone
+            # keeps the cast at full strength without touching the volume.
+            self.mute.engage(pin=self._couples)
             self._notify("mute", True)
             self._cast_silenced = False
         elif mode == "this_pc":           # PC audible, speakers fed silence

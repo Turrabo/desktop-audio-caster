@@ -38,7 +38,7 @@ DELAY_PRESETS = (("Low", 50), ("Balanced", 150), ("Safe", 400))
 OUTPUT_OPTIONS = (
     ("speakers", "Speakers only", "This PC will be muted."),
     ("this_pc", "This PC only", "Speakers will be muted."),
-    ("both", "Both", "Speaker volume follows this PC's volume."),
+    ("both", "Both", "Both play together."),
     ("auto", "Auto", "Unmuting this PC will mute your speakers, and vice versa."),
 )
 
