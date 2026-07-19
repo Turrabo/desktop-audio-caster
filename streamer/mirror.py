@@ -626,6 +626,8 @@ class MirrorSession:
         self._host = ""
         self._local_ip = ""
         self._app_id = ""
+        self._pd_logged: int | None = None   # last receiver playout delay logged
+        self._pd_logged_at = 0.0
         self.trim_count = 0        # mirror does not trim; kept for the contract
         self.recast_count = 0
 
@@ -658,7 +660,8 @@ class MirrorSession:
     def lag_seconds(self) -> float | None:
         """Receiver's LIVE playout delay from Cast Feedback, in seconds. NOTE:
         semantically different from CastSession.lag_seconds (measured sent-minus
-        -played); this is the receiver's own target playout window (~0.4 s)."""
+        -played); this is the receiver's own playout window, which tracks the
+        requested target delay (measured: honoured exactly, solo and group)."""
         sender = self._sender
         if not self._playing or sender is None:
             return None
@@ -712,6 +715,7 @@ class MirrorSession:
             sink.start()
         self._answer_at = time.monotonic()
         self._playing = False
+        self._pd_logged = None      # fresh stream: log its playout delay anew
         self._emit("BUFFERING", self._cast.name)
 
     def _teardown_stream(self) -> None:
@@ -790,6 +794,27 @@ class MirrorSession:
             return "checkpoint stalled"
         return None
 
+    def _log_playout_delay(self) -> None:
+        """Surface the receiver's SELF-REPORTED playout delay (from Cast
+        Feedback) whenever it changes materially. This is the ground truth for
+        whether the receiver honours the requested target delay or silently
+        clamps it - the number the latency slider is actually negotiating."""
+        sender = self._sender
+        if sender is None:
+            return
+        pd = sender.stats.snapshot()["playout_delay_ms"]
+        if pd < 0:
+            return
+        now = time.monotonic()
+        if self._pd_logged is None or (abs(pd - self._pd_logged) >= 15
+                                       and now - self._pd_logged_at >= 10.0):
+            # The time floor stops an oscillating receiver (two values straddling
+            # the 15 ms deadband) from logging on every watchdog pass.
+            log.info("receiver playout delay %d ms (target %d ms)",
+                     pd, self._target_delay)
+            self._pd_logged = pd
+            self._pd_logged_at = now
+
     def _reoffer(self) -> bool:
         """Re-negotiate with the current target delay (a live latency change).
         Runs ON the watchdog thread. BUFFERING -> PLAYING, no RECONNECTING noise."""
@@ -818,6 +843,7 @@ class MirrorSession:
             reason = self._failure_reason(time.monotonic())
             if reason is None:
                 backoff = BACKOFF_START
+                self._log_playout_delay()
                 self._emit("PLAYING", self._playing_detail())
                 continue
             log.warning("mirror unhealthy: %s", reason)

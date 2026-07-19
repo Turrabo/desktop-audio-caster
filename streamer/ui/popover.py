@@ -449,7 +449,9 @@ class Popover:
                     "on low-latency casts.")
         else:
             note = ("Lower latency reduces the playback gap between your "
-                    "speakers and your PC, but may cause stuttering on busy WiFi.")
+                    "speakers and your PC, but may cause stuttering on busy "
+                    "WiFi. Speaker groups add ~0.6s of sync delay this can't "
+                    "remove.")
         self.lat_note.configure(text=note)
 
     @staticmethod

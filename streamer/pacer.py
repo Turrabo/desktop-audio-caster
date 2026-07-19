@@ -20,6 +20,16 @@ log = logging.getLogger(__name__)
 TICK_SECONDS = 0.02          # 20 ms
 MAX_BACKLOG_SECONDS = 0.2    # captured audio older than this is dropped (bounds latency)
 
+# Standing-backlog trim. The FIFO's inflow rate equals its outflow rate, so any
+# depth it holds when the clock starts (or gains from a capture burst / clock
+# skew) persists FOREVER as pure added latency - the cast plays that many ms
+# behind and nothing else ever drains it. Every TRIM_CHECK_SECONDS the pacer
+# looks at the MINIMUM depth seen over the window (the guaranteed-standing part,
+# immune to inflow jitter) and drops all but a small residual, converting the
+# permanent latency into one skip-forward.
+TRIM_CHECK_SECONDS = 5.0
+TRIM_RESIDUAL_SECONDS = 0.04  # jitter headroom left in place (2 ticks)
+
 
 class Pacer:
     def __init__(self, fmt: CaptureFormat, sink: Callable[[bytes], None]):
@@ -32,6 +42,7 @@ class Pacer:
         self.silence_bytes_sent = 0
         self.real_bytes_sent = 0
         self.dropped_bytes = 0
+        self.trims = 0               # standing-backlog trims performed
 
     def feed(self, data: bytes) -> None:
         """Called from the capture thread."""
@@ -51,11 +62,15 @@ class Pacer:
 
     def _run(self) -> None:
         fb = self._fmt.frame_bytes
+        bps = self._fmt.bytes_per_second
         started = time.monotonic()
         samples_emitted = 0
+        min_depth: int | None = None       # floor of post-take FIFO depth
+        next_trim = started + TRIM_CHECK_SECONDS
         while not self._stop.is_set():
             time.sleep(TICK_SECONDS)
-            target_samples = int((time.monotonic() - started) * self._fmt.rate)
+            now = time.monotonic()
+            target_samples = int((now - started) * self._fmt.rate)
             need = (target_samples - samples_emitted) * fb
             if need <= 0:
                 continue
@@ -64,6 +79,9 @@ class Pacer:
                 take -= take % fb
                 chunk = bytes(self._fifo[:take])
                 del self._fifo[:take]
+                depth = len(self._fifo)
+            if min_depth is None or depth < min_depth:
+                min_depth = depth
             silence = need - take
             if silence > 0:
                 chunk += b"\x00" * silence
@@ -71,6 +89,34 @@ class Pacer:
             self.real_bytes_sent += take
             samples_emitted += need // fb
             self._sink(chunk)
+            if now >= next_trim:
+                self._trim_standing(min_depth, bps, fb)
+                min_depth = None
+                next_trim = now + TRIM_CHECK_SECONDS
+
+    def _trim_standing(self, min_depth: int | None, bps: int, fb: int) -> None:
+        """Drop the guaranteed-standing part of the FIFO (its window-minimum
+        depth) beyond the jitter residual. min_depth is the floor observed over
+        the whole window, so this never eats into normal inflow jitter."""
+        residual = int(TRIM_RESIDUAL_SECONDS * bps)
+        if min_depth is None or min_depth <= residual:
+            return
+        cut = min_depth - residual
+        cut -= cut % fb
+        if cut <= 0:
+            return
+        with self._lock:
+            cut = min(cut, len(self._fifo))
+            cut -= cut % fb
+            del self._fifo[:cut]
+            # Counters stay under the lock: feed()'s overflow drop increments
+            # dropped_bytes from the capture thread, and += is not atomic.
+            if cut > 0:
+                self.dropped_bytes += cut
+                self.trims += 1
+        if cut > 0:
+            log.info("pacer: trimmed %.0f ms standing backlog (latency debt)",
+                     cut / bps * 1000)
 
     def stop(self) -> None:
         self._stop.set()

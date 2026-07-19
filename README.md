@@ -53,8 +53,12 @@ Two cast paths, chosen automatically per speaker (`cast_mode` in config:
 
 - **Mirror (default when possible)** — the same low-latency Cast protocol
   Chrome uses for tab casting: Opus audio over encrypted RTP, negotiated
-  directly with the speaker. Sub-second end-to-end (~0.4 s receiver playout
-  delay, measured), solo and group. Needs 48 kHz stereo capture (the usual
+  directly with the speaker. The receiver honours the requested playout delay
+  exactly (the in-app latency slider), and the sender chain adds only ~25 ms,
+  so a solo speaker measures ~100 ms end-to-end at a 50 ms setting (measured
+  with an AV-sync tester). Speaker groups add a further ~0.6 s: Cast's own
+  multi-room sync buffer, outside the protocol's control, so a group measures
+  ~0.7 s regardless of the slider. Needs 48 kHz stereo capture (the usual
   Windows default); anything else uses the HTTP path.
 - **HTTP (automatic fallback)** — battle-tested
   [pychromecast](https://github.com/home-assistant-libs/pychromecast) plus
