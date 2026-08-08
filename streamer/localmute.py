@@ -85,10 +85,19 @@ def _endpoint():
 
 
 def _device_id(device) -> str | None:
-    try:
-        return device.GetId()
-    except Exception:
-        return None
+    """Endpoint id, used to tell a real default-device change from a redundant
+    notification. AudioUtilities.GetSpeakers() hands back a pycaw AudioDevice
+    wrapper exposing `.id`; the raw IMMDevice's GetId() is the fallback in case
+    a future pycaw returns the interface directly."""
+    for get in (lambda: device.id, lambda: device.GetId()):
+        try:
+            value = get()
+            if value:
+                return str(value)
+        except Exception:
+            continue
+    log.debug("could not read endpoint id; device-change detection degraded")
+    return None
 
 
 def _marker_path() -> Path:
