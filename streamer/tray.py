@@ -6,7 +6,9 @@ grey idle, amber transitional, blue casting, red error.
 
 Single instance: a localhost guard port doubles as a control channel - a
 second launch sends SHOW to the first instance (which pops the popover) and
-exits, so autostart + manual launch is never a silent no-op.
+exits, so autostart + manual launch is never a silent no-op. The port is
+claimed in main(), BEFORE any AppController is built, because constructing one
+runs endpoint crash-recovery and a loser must not touch the winner's live cast.
 """
 from __future__ import annotations
 
@@ -65,8 +67,39 @@ def _state_color(state: str):
     return COLORS["idle"]
 
 
+def claim_instance() -> socket.socket | None:
+    """Bind the guard port, returning the listening socket - or None if another
+    instance already holds it (having first asked it to show its popover).
+
+    Called BEFORE any AppController exists. That ordering is load-bearing:
+    AppController.__init__ runs recover_from_crash(), which restores the
+    endpoint from the mute marker and then deletes it. A second launch during a
+    live cast therefore used to un-mute the PC mid-cast and destroy the running
+    instance's crash-safety net - so if that instance later died hard, the
+    endpoint stayed muted with nothing left to recover from."""
+    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        guard.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+    except OSError:
+        guard.close()
+        # An instance exists - ask it to show its popover, then bow out.
+        try:
+            with socket.create_connection(
+                    ("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=2) as s:
+                s.sendall(b"SHOW\n")
+        except OSError as e:
+            # Either the port belongs to something that isn't us, or the owner
+            # bound but is not listening yet. Either way we cannot hand off.
+            log.warning("guard port %d is taken but did not answer (%s)",
+                        SINGLE_INSTANCE_PORT, e)
+        return None
+    guard.listen(2)
+    return guard
+
+
 class TrayApp:
-    def __init__(self):
+    def __init__(self, guard: socket.socket):
+        self._guard = guard
         self.ctl = AppController()
         self.popover = Popover(self.ctl, on_exit=self._exit)
         self.icon = pystray.Icon(
@@ -80,33 +113,34 @@ class TrayApp:
 
     # -- single instance + control channel ---------------------------------
 
-    def claim_instance(self) -> bool:
-        self._guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            self._guard.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
-        except OSError:
-            # An instance exists - ask it to show its popover, then bow out.
-            try:
-                with socket.create_connection(
-                        ("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=2) as s:
-                    s.sendall(b"SHOW\n")
-            except OSError:
-                pass
-            return False
-        self._guard.listen(2)
+    def _serve_control(self) -> None:
         threading.Thread(target=self._control_loop, name="instance-ctl",
                          daemon=True).start()
-        return True
 
     def _control_loop(self) -> None:
+        """Serve SHOW requests for the lifetime of the process.
+
+        Only an accept() failure ends this loop. Per-connection errors are
+        contained: a client that connects and resets (an EDR/AV agent probing
+        localhost listeners will) raises ConnectionResetError - an OSError - and
+        used to kill the loop for good. After that every later launch still
+        connected and sent successfully, because the listening socket's backlog
+        accepts it, so each one believed it had handed off and exited. The app
+        became a permanent silent no-op until the orphan was killed by hand."""
         while True:
             try:
                 conn, _ = self._guard.accept()
-                with conn:
-                    if b"SHOW" in conn.recv(16):
-                        self.popover.post(self.popover.show)
             except OSError:
                 return
+            try:
+                with conn:
+                    # A peer that connects and says nothing must not wedge the
+                    # single-threaded loop and lock out every future launch.
+                    conn.settimeout(2)
+                    if b"SHOW" in conn.recv(16):
+                        self.popover.post(self.popover.show)
+            except OSError as e:
+                log.debug("control connection dropped: %s", e)
 
     # -- events --------------------------------------------------------------
 
@@ -139,9 +173,7 @@ class TrayApp:
     # -- lifecycle --------------------------------------------------------------
 
     def run(self) -> int:
-        if not self.claim_instance():
-            log.info("another instance is running - asked it to show; exiting")
-            return 0
+        self._serve_control()
         startup.repair_if_stale()
         threading.Thread(
             target=lambda: firewall.ensure_allowed(self.ctl.cfg, cfg_mod.save),
@@ -153,7 +185,11 @@ class TrayApp:
 
 def main() -> int:
     cfg_mod.setup_logging()
-    return TrayApp().run()
+    guard = claim_instance()
+    if guard is None:
+        log.info("another instance is running - asked it to show; exiting")
+        return 0
+    return TrayApp(guard).run()
 
 
 if __name__ == "__main__":
