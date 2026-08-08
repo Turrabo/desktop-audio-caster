@@ -30,6 +30,16 @@ MAX_BACKLOG_SECONDS = 0.2    # captured audio older than this is dropped (bounds
 TRIM_CHECK_SECONDS = 5.0
 TRIM_RESIDUAL_SECONDS = 0.04  # jitter headroom left in place (2 ticks)
 
+# Ceiling on how much the clock will try to catch up in one tick. The pacer's
+# demand is derived from wall time since the cast started, so a long stall - a
+# suspend/resume, a pathological scheduler hiccup - asks for the WHOLE gap at
+# once, and the shortfall is materialised as literal silence bytes. Unclamped,
+# an hour's gap is a ~690 MB allocation (copied again by the silence gate and
+# again by the mirror's frame loop, under a lock). Past this ceiling the clock
+# re-anchors and skips the gap instead of filling it, which is what the rest of
+# this module already does to bound latency.
+MAX_CATCHUP_SECONDS = 0.5
+
 
 class Pacer:
     def __init__(self, fmt: CaptureFormat, sink: Callable[[bytes], None]):
@@ -43,6 +53,7 @@ class Pacer:
         self.real_bytes_sent = 0
         self.dropped_bytes = 0
         self.trims = 0               # standing-backlog trims performed
+        self.skips = 0               # clock re-anchors after a long stall
 
     def feed(self, data: bytes) -> None:
         """Called from the capture thread."""
@@ -67,6 +78,8 @@ class Pacer:
         samples_emitted = 0
         min_depth: int | None = None       # floor of post-take FIFO depth
         next_trim = started + TRIM_CHECK_SECONDS
+        max_catchup = int(MAX_CATCHUP_SECONDS * bps)
+        max_catchup -= max_catchup % fb
         while not self._stop.is_set():
             time.sleep(TICK_SECONDS)
             now = time.monotonic()
@@ -74,6 +87,14 @@ class Pacer:
             need = (target_samples - samples_emitted) * fb
             if need <= 0:
                 continue
+            if need > max_catchup:
+                # Skip the gap rather than emit it: re-anchor the emitted count
+                # so the next tick measures from here.
+                log.warning("pacer: %.1f s gap in the clock - skipping forward",
+                            need / bps)
+                samples_emitted = target_samples - (max_catchup // fb)
+                need = max_catchup
+                self.skips += 1
             with self._lock:
                 take = min(need, len(self._fifo))
                 take -= take % fb
