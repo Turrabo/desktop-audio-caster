@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 TRANSITIONAL_STATES = {"DISCOVERING", "CONNECTING", "LAUNCHING", "WAITING_STREAM",
                        "BUFFERING", "RECONNECTING", "STOPPING"}
 
+# 'auto' swings audio between the desk and the whole house, so it absorbs a
+# transient toggle rather than acting on the first edge.
+AUTO_SETTLE_SECONDS = 1.5
+
 
 class AppController:
     def __init__(self):
@@ -59,7 +63,12 @@ class AppController:
         # it is instant, reversible, and never touches the volume choke point.
         self._cast_silenced = False
         self._output_mode = "speakers"       # active mode of the live cast
-        self._auto_stop: threading.Event | None = None   # auto-monitor stopper
+        # "speakers" is a starting position, not a lock: when the user un-mutes
+        # mid-cast we follow them to "both" semantics for the rest of the
+        # session. This tracks that live deviation WITHOUT persisting it - a
+        # stray key press must never rewrite the user's saved preference.
+        self._following_user = False
+        self._auto_settle: threading.Timer | None = None
         self.volumes = VolumeManager(self)
 
     # -- events ----------------------------------------------------------
@@ -158,6 +167,10 @@ class AppController:
                                     device_hint=self.cfg["capture_device"])
         self._couples = self.capture.couples_volume
         try:
+            # Watch the endpoint for the whole cast regardless of mode: every
+            # mode either holds a mute or wants to know when the user changes
+            # one. One registration, no polling.
+            self.mute.arm(self._on_foreign_endpoint)
             self.server = StreamServer(self.capture.format, self.cfg["port"])
             self.pacer = Pacer(self.capture.format, sink=self._pacer_sink)
             self.server.start()
@@ -193,8 +206,10 @@ class AppController:
 
     def _abort_partial_start(self) -> None:
         """Release whatever _do_start managed to build before it failed."""
-        self._stop_auto_monitor()
+        self._cancel_auto_settle()
         self.mute.release()
+        self.mute.disarm()
+        self._following_user = False
         self._cast_silenced = False
         if self.session is not None:
             try:
@@ -282,12 +297,16 @@ class AppController:
         LocalMute) and the cast-silence gate. Assumes a cast is up."""
         from . import localmute
         self._output_mode = mode
-        self._stop_auto_monitor()
-        if mode == "speakers":            # PC muted, full-strength cast
-            # Pin the volume too only when the capture couples to it (endpoint
-            # loopback); the process-loopback path is decoupled, so muting alone
-            # keeps the cast at full strength without touching the volume.
-            self.mute.engage(pin=self._couples)
+        self._cancel_auto_settle()
+        self._following_user = False
+        if mode in ("speakers", "speakers_locked"):
+            # PC muted, full-strength cast. Pin the volume only when the capture
+            # couples to it (endpoint loopback); the process-loopback path is
+            # decoupled, so muting alone keeps the cast at full strength.
+            # "speakers" mutes and then follows the user; "speakers_locked"
+            # holds the mute down.
+            self.mute.engage(pin=self._couples,
+                             enforce=(mode == "speakers_locked"))
             self._notify("mute", True)
             self._cast_silenced = False
         elif mode == "this_pc":           # PC audible, speakers fed silence
@@ -302,37 +321,62 @@ class AppController:
             self.mute.release()           # never force; the user drives mute
             self._notify("mute", False)
             self._cast_silenced = not localmute.endpoint_muted()
-            self._start_auto_monitor()
         else:
             log.warning("unknown output_mode %r; treating as speakers", mode)
             self._apply_output_mode("speakers")
 
-    def _start_auto_monitor(self) -> None:
-        self._auto_stop = threading.Event()
-        threading.Thread(target=self._auto_monitor, args=(self._auto_stop,),
-                         name="auto-output", daemon=True).start()
+    # -- endpoint change handling (event-driven; see localmute) ----------------
 
-    def _stop_auto_monitor(self) -> None:
-        if self._auto_stop is not None:
-            self._auto_stop.set()
-            self._auto_stop = None
+    def _on_foreign_endpoint(self, muted: bool, volume: float) -> None:
+        """Someone other than us changed the endpoint mute/volume. Called from
+        LocalMute's COM thread, so do nothing here but hand off.
 
-    def _auto_monitor(self, stop: threading.Event) -> None:
-        """Watch the endpoint mute; on a SETTLED change, flip the cast-silence
-        gate inversely (PC muted -> speakers play; PC unmuted -> desk only). The
-        settle absorbs a transient toggle (a Teams call, a media-key fumble) so
-        a brief unmute doesn't strobe the whole house."""
-        from . import localmute
-        settle = 1.5
-        acted = localmute.endpoint_muted()
-        candidate, since = acted, time.monotonic()
-        while not stop.wait(0.5):
-            cur = localmute.endpoint_muted()
-            if cur != candidate:
-                candidate, since = cur, time.monotonic()
-            elif cur != acted and time.monotonic() - since >= settle:
-                acted = cur
-                self.enqueue(lambda muted=cur: self._do_auto_silence(not muted))
+        'auto' keeps a settle delay: it swings audio between the desk and the
+        whole house, and a transient toggle (a Teams call grabbing the mute key,
+        a media-key fumble) shouldn't strobe the room. 'speakers' applies at
+        once - there the user pressed mute expecting an immediate result."""
+        if self._output_mode == "auto":
+            self._cancel_auto_settle()
+            t = threading.Timer(
+                AUTO_SETTLE_SECONDS,
+                lambda: self.enqueue(lambda: self._do_auto_silence(not muted)))
+            t.daemon = True
+            self._auto_settle = t
+            t.start()
+        elif self._output_mode in ("speakers", "speakers_locked"):
+            self.enqueue(lambda: self._do_follow_user(muted))
+
+    def _cancel_auto_settle(self) -> None:
+        if self._auto_settle is not None:
+            self._auto_settle.cancel()
+            self._auto_settle = None
+
+    def _do_follow_user(self, muted: bool) -> None:
+        """The mute key as a first-class control of this app.
+
+        In 'speakers' the initial mute is a starting position: un-muting means
+        "I want it at my desk too", so the cast keeps playing at full strength
+        and the PC becomes audible - i.e. live 'both' semantics - and the volume
+        pin is dropped so loudness is the user's again. Re-muting goes back.
+
+        In 'speakers_locked' LocalMute has already undone the change; there is
+        nothing to follow, we just keep the UI honest."""
+        if self.cast_target is None or self._output_mode not in (
+                "speakers", "speakers_locked"):
+            return                                  # stale
+        if self._output_mode == "speakers_locked":
+            self._notify("mute", True)
+            return
+        following = not muted
+        if following == self._following_user:
+            return                                  # nothing changed
+        self._following_user = following
+        # Keep the pin only while we are actually holding the PC silent.
+        self.mute.set_policy(pin=self._couples and not following)
+        self._notify("mute", not following)
+        log.info("output follows user: %s",
+                 "PC audible alongside the cast (un-muted)" if following
+                 else "PC silent again (re-muted)")
 
     def _do_auto_silence(self, silenced: bool) -> None:
         # Stale-guard: only act if still auto and still the same live cast.
@@ -344,9 +388,14 @@ class AppController:
 
     def _do_stop(self, final: tuple[str, str | None] = ("IDLE", None)) -> None:
         self._set_state("STOPPING", self.cast_target)
-        self._stop_auto_monitor()
-        # Mute restore first: fast, local, and the thing users panic about.
+        self._cancel_auto_settle()
+        # Mute restore first: fast, local, and the thing users panic about. The
+        # watcher is still live at this point, but release()'s writes carry our
+        # context GUID so it recognises them as ours and does not "defend"
+        # against them; disarm() then unregisters it.
         self.mute.release()
+        self.mute.disarm()
+        self._following_user = False
         self._notify("mute", False)
         self._cast_silenced = False
         if self.session is not None:

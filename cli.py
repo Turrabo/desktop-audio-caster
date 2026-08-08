@@ -98,7 +98,7 @@ def main() -> int:
     p_start.add_argument("--mode", choices=["auto", "mirror", "http"],
                          help="cast path (default from config: auto)")
     p_start.add_argument("--output-mode",
-                         choices=["speakers", "this_pc", "both", "auto"],
+                         choices=list(cfg_mod.OUTPUT_MODES),
                          help="where audio is audible while casting")
     p_start.add_argument("--no-mute", action="store_true",
                          help="legacy alias for --output-mode both")

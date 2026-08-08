@@ -40,9 +40,10 @@ The gear in the header opens **Settings**:
 - **Latency** — a slider (with Low / Balanced / Safe presets) for the mirror
   path's target delay. Changing it re-negotiates a live cast on the fly.
 - **Play on** — where audio is audible while casting: *Speakers only* (this PC
-  muted, the default), *This PC only* (speakers silent), *Both*, or *Auto*
-  (your PC's own mute switches between them — mute the PC to send audio to the
-  room, unmute to keep it at your desk).
+  muted, the default), *Speakers only (locked)* (as before but the mute is held
+  down), *This PC only* (speakers silent), *Both*, or *Auto* (your PC's own mute
+  switches between them — mute the PC to send audio to the room, unmute to keep
+  it at your desk).
 
 Config + logs live in `%APPDATA%\desktop-audio-streamer\`.
 
@@ -93,15 +94,28 @@ Two capture backends, chosen automatically at cast start:
 
 ## Silent-machine behaviour
 
-By default (output mode *Speakers only*) the local output endpoint is muted
-while casting, so only the speakers make sound, and the app re-asserts that mute
-while the cast runs (a stray mute-key press won't un-silence the room). On the
-process-loopback path that's all it does — the cast is decoupled, so your PC
-volume is left alone. On the endpoint-loopback fallback it also pins the volume
-to 100% (the capture would otherwise be scaled by it). A marker file restores
-the endpoint if the app dies without cleanup. The other output modes leave the
-PC audible and instead feed silence to the cast when the speakers should be
-quiet, so no device volume is ever written for muting.
+By default (output mode *Speakers only*) the local output endpoint is muted when
+casting starts, so only the speakers make sound. That mute is a starting
+position, not a lock: your mute key still works. Un-mute mid-cast and the app
+reads it as intent — this PC joins in, the speakers keep playing at full
+strength, and the volume is yours again; mute once more and it goes back. Pick
+*Speakers only (locked)* if you'd rather the room stayed silent whatever gets
+pressed, and the mute is re-asserted instead.
+
+Endpoint changes arrive as WASAPI notifications
+(`IAudioEndpointVolumeCallback`), not by polling, so the reaction is a few
+milliseconds. Every write the app makes is stamped with its own event-context
+GUID, so its watcher can tell the app's changes from yours and never fights
+itself.
+
+On the process-loopback path muting is all it does — the cast is decoupled, so
+your PC volume is left alone. On the endpoint-loopback fallback it also pins the
+volume to 100% while the PC is muted, because there the endpoint volume scales
+the capture and 0 would mean a dead cast; that pin is dropped as soon as you
+take the PC off mute. A marker file restores the endpoint if the app dies
+without cleanup. The other output modes leave the PC audible and instead feed
+silence to the cast when the speakers should be quiet, so no device volume is
+ever written for muting.
 
 ## Volume safety
 

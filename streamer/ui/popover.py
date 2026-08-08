@@ -36,7 +36,10 @@ from .widgets import (ACCENT, BG, CARD, DIVIDER, ERROR, ERROR_BG, ERROR_FG,
 DELAY_MIN, DELAY_MAX = 30, 500
 DELAY_PRESETS = (("Low", 50), ("Balanced", 150), ("Safe", 400))
 OUTPUT_OPTIONS = (
-    ("speakers", "Speakers only", "This PC will be muted."),
+    ("speakers", "Speakers only", "This PC is muted when casting starts. "
+                                  "Un-mute it and this PC joins in."),
+    ("speakers_locked", "Speakers only (locked)",
+     "This PC stays muted. The mute key will not override it."),
     ("this_pc", "This PC only", "Speakers will be muted."),
     ("both", "Both", "Both play together."),
     ("auto", "Auto", "Unmuting this PC will mute your speakers, and vice versa."),

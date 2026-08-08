@@ -14,10 +14,26 @@ class FakeMute:
         self.engaged = False
         self.releases = 0
         self.pin = None
+        self.enforce = None
+        self.armed = False
 
-    def engage(self, pin=True):
+    def arm(self, on_foreign):
+        self.armed = True
+        self.on_foreign = on_foreign
+
+    def disarm(self):
+        self.armed = False
+
+    def engage(self, pin=True, enforce=False):
         self.engaged = True
         self.pin = pin
+        self.enforce = enforce
+
+    def set_policy(self, pin=None, enforce=None):
+        if pin is not None:
+            self.pin = pin
+        if enforce is not None:
+            self.enforce = enforce
 
     def release(self):
         self.engaged = False
@@ -31,11 +47,12 @@ def make_ctl(couples=True):
     ctl._cast_silenced = False
     ctl._output_mode = "speakers"
     ctl._couples = couples
-    ctl._auto_stop = None
+    ctl._auto_settle = None
+    ctl._following_user = False
     ctl.cast_target = "Kitchen"
     ctl.session = object()
     ctl._notify = lambda *a: None
-    ctl._start_auto_monitor = lambda: None       # don't spawn a thread in tests
+    ctl.enqueue = lambda fn: fn()                # run ops inline in tests
     return ctl
 
 
@@ -91,6 +108,75 @@ class TestApplyOutputMode(unittest.TestCase):
         ctl._apply_output_mode("bogus")
         self.assertTrue(ctl.mute.engaged)
         self.assertEqual(ctl._output_mode, "speakers")
+
+    def test_speakers_does_not_hold_the_mute(self):
+        ctl = make_ctl()
+        ctl._apply_output_mode("speakers")
+        self.assertFalse(ctl.mute.enforce)       # a starting position, not a lock
+
+    def test_speakers_locked_holds_the_mute(self):
+        ctl = make_ctl()
+        ctl._apply_output_mode("speakers_locked")
+        self.assertTrue(ctl.mute.engaged)
+        self.assertTrue(ctl.mute.enforce)
+        self.assertFalse(ctl._cast_silenced)
+
+
+class TestFollowUser(unittest.TestCase):
+    """'speakers' treats the mute key as intent: un-muting mid-cast moves the
+    live cast to 'both' semantics instead of being fought."""
+
+    def test_unmute_stops_pinning_and_keeps_casting(self):
+        ctl = make_ctl(couples=True)
+        ctl._apply_output_mode("speakers")
+        self.assertTrue(ctl.mute.pin)
+        ctl._do_follow_user(muted=False)
+        self.assertTrue(ctl._following_user)
+        self.assertFalse(ctl.mute.pin)           # loudness is the user's again
+        self.assertFalse(ctl._cast_silenced)     # speakers keep playing
+
+    def test_remute_restores_the_pin(self):
+        ctl = make_ctl(couples=True)
+        ctl._apply_output_mode("speakers")
+        ctl._do_follow_user(muted=False)
+        ctl._do_follow_user(muted=True)
+        self.assertFalse(ctl._following_user)
+        self.assertTrue(ctl.mute.pin)
+
+    def test_decoupled_capture_never_pins(self):
+        ctl = make_ctl(couples=False)            # process loopback
+        ctl._apply_output_mode("speakers")
+        ctl._do_follow_user(muted=False)
+        ctl._do_follow_user(muted=True)
+        self.assertFalse(ctl.mute.pin)
+
+    def test_locked_mode_does_not_follow(self):
+        ctl = make_ctl()
+        ctl._apply_output_mode("speakers_locked")
+        ctl._do_follow_user(muted=False)
+        self.assertFalse(ctl._following_user)
+
+    def test_ignored_when_no_cast(self):
+        ctl = make_ctl()
+        ctl._apply_output_mode("speakers")
+        ctl.cast_target = None
+        ctl._do_follow_user(muted=False)
+        self.assertFalse(ctl._following_user)
+
+    def test_repeated_same_state_is_a_no_op(self):
+        ctl = make_ctl()
+        ctl._apply_output_mode("speakers")
+        ctl._do_follow_user(muted=False)
+        ctl.mute.pin = "sentinel"
+        ctl._do_follow_user(muted=False)         # same state again
+        self.assertEqual(ctl.mute.pin, "sentinel")
+
+    def test_apply_mode_resets_following(self):
+        ctl = make_ctl()
+        ctl._apply_output_mode("speakers")
+        ctl._do_follow_user(muted=False)
+        ctl._apply_output_mode("speakers")       # user re-picks the mode
+        self.assertFalse(ctl._following_user)
 
 
 class TestAutoSilenceGuard(unittest.TestCase):
