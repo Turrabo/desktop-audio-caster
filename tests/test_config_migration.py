@@ -70,6 +70,34 @@ class TestConfig(unittest.TestCase):
         config.set_user_value("output_mode", "this_pc")
         self.assertEqual(config.load()["output_mode"], "this_pc")
 
+    # -- migration must survive a save (regression) ---------------------------
+
+    def test_migration_survives_save_roundtrip(self):
+        """save() used to re-read the RAW file and rebuild from DEFAULTS, so the
+        first cast wrote output_mode=speakers over a migrated 'both' - silently
+        re-muting a user who had explicitly set mute_local_while_casting=false,
+        and killing the migration for good (output_mode was now on disk)."""
+        self._write({"mute_local_while_casting": False, "last_device": "Kitchen"})
+        self.assertEqual(config.load()["output_mode"], "both")
+        config.save({"last_device": "Living Room"})       # what a cast does
+        self.assertEqual(self._read()["output_mode"], "both")
+        self.assertEqual(config.load()["output_mode"], "both")
+
+    def test_migration_survives_set_user_value(self):
+        self._write({"mute_local_while_casting": False})
+        config.set_user_value("mirror_target_delay_ms", 120)
+        self.assertEqual(config.load()["output_mode"], "both")
+
+    def test_save_stamps_config_version(self):
+        self._write({"last_device": "X"})
+        config.save({"last_device": "X"})
+        self.assertEqual(self._read()["config_version"], config.CONFIG_VERSION)
+
+    def test_legacy_true_still_lands_on_speakers_after_save(self):
+        self._write({"mute_local_while_casting": True})
+        config.save({"last_device": "Den"})
+        self.assertEqual(config.load()["output_mode"], "speakers")
+
 
 if __name__ == "__main__":
     unittest.main()
