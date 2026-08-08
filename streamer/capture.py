@@ -92,7 +92,15 @@ class LoopbackCapture:
     def start(self) -> None:
         self._stop.clear()
         self._start_silence_keeper()
-        self._open_stream()
+        try:
+            self._open_stream()
+        except Exception:
+            # The keeper is already running and nothing else holds a reference
+            # to this object once start() raises, so without this it would
+            # render zeros to the default device for the life of the process -
+            # and every retry would add another one.
+            self._stop.set()
+            raise
         self._thread = threading.Thread(target=self._run, name="capture", daemon=True)
         self._thread.start()
 
@@ -119,14 +127,22 @@ class LoopbackCapture:
                 stream = self._pa.open(format=pyaudio.paInt16, channels=ch, rate=rate,
                                        output=True, output_device_index=out["index"],
                                        frames_per_buffer=FRAMES_PER_BUFFER)
-                zeros = b"\x00" * (FRAMES_PER_BUFFER * ch * 2)
-                while not self._stop.is_set():
-                    stream.write(zeros)
-                stream.stop_stream()
-                stream.close()
+                try:
+                    zeros = b"\x00" * (FRAMES_PER_BUFFER * ch * 2)
+                    while not self._stop.is_set():
+                        stream.write(zeros)
+                finally:
+                    # Without this a device change leaks one render stream per
+                    # error, since write() raising skips the close below.
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except OSError:
+                        pass
             except OSError as e:
                 log.warning("silence keeper error (device change?): %s - reopening", e)
-                time.sleep(1.0)
+                if self._stop.wait(1.0):
+                    return
 
     def _open_stream(self) -> None:
         lb = self._find_loopback()
@@ -153,22 +169,43 @@ class LoopbackCapture:
 
     def _run(self) -> None:
         consecutive_errors = 0
-        while not self._stop.is_set():
-            try:
-                data = self._stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
-                consecutive_errors = 0
-                if data:
-                    self._on_data(data)
-            except OSError as e:
-                consecutive_errors += 1
-                log.warning("capture read error (%d): %s", consecutive_errors, e)
-                if consecutive_errors >= 5:
-                    self.healthy = False
-                    self._reopen()
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = self._stream.read(FRAMES_PER_BUFFER,
+                                             exception_on_overflow=False)
                     consecutive_errors = 0
+                    if data:
+                        self._on_data(data)
+                except Exception as e:
+                    # Broad by necessity, exactly as in ProcessLoopbackCapture:
+                    # comtypes raises COMError on a failed HRESULT and COMError
+                    # is NOT an OSError subclass, so a device invalidated on
+                    # sleep/resume would slip through a narrower catch and kill
+                    # this thread with healthy still True - leaving the watchdog
+                    # blind and the cast playing pure silence.
+                    consecutive_errors += 1
+                    log.warning("capture read error (%d): %s", consecutive_errors, e)
+                    if consecutive_errors >= 5:
+                        self.healthy = False
+                        self._reopen()
+                        consecutive_errors = 0
+        except Exception:
+            log.exception("capture thread died")
+        finally:
+            if not self._stop.is_set():
+                # Died on its own rather than being stopped: mark unhealthy so
+                # the caster watchdog tears down and re-casts.
+                self.healthy = False
 
     def _reopen(self) -> None:
-        """Device invalidated (sleep/resume, default-device change, driver)."""
+        """Device invalidated (sleep/resume, default-device change, driver).
+
+        Every wait here is on the stop event, not a bare sleep: a stop arriving
+        mid-retry used to cost up to 3 s, overrunning stop()'s 3 s join, which
+        took the leak path and left this thread alive - still bound to the
+        caster's feed callback, which resolves the pacer LIVE. The next cast
+        then had two captures feeding one clock."""
         while not self._stop.is_set():
             try:
                 if self._stream is not None:
@@ -177,14 +214,16 @@ class LoopbackCapture:
                         self._stream.close()
                     except OSError:
                         pass
-                time.sleep(1.0)
+                if self._stop.wait(1.0):
+                    return
                 self._open_stream()
                 self.restart_count += 1
                 log.info("capture reopened (restart #%d)", self.restart_count)
                 return
             except (OSError, RuntimeError) as e:
                 log.warning("capture reopen failed, retrying: %s", e)
-                time.sleep(2.0)
+                if self._stop.wait(2.0):
+                    return
 
     def stop(self) -> None:
         self._stop.set()
