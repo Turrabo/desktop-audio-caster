@@ -28,18 +28,38 @@ class FakeEndpoint:
         self._vol = v
 
 
+class _FakeDevice:
+    def __init__(self, endpoint):
+        self.EndpointVolume = endpoint
+        self.id = "fake-endpoint-0"
+
+
 class MuteTestBase(unittest.TestCase):
+    """_speakers is patched alongside _endpoint so nothing here can reach the
+    machine's real audio device - arm() resolves through _speakers() and
+    engage() prefers the interface it holds."""
+
     def setUp(self):
         self.ep = FakeEndpoint()
         self._orig_ep = localmute._endpoint
+        self._orig_speakers = localmute._speakers
         self._orig_marker = localmute._marker_path
+        self._orig_enum = localmute.AudioUtilities.GetDeviceEnumerator
         localmute._endpoint = lambda: self.ep
+        localmute._speakers = lambda: _FakeDevice(self.ep)
+        localmute.AudioUtilities.GetDeviceEnumerator = self._no_enumerator
         self._marker = {}                       # in-memory marker
         localmute._marker_path = lambda: _FakePath(self._marker)
 
+    @staticmethod
+    def _no_enumerator():
+        raise AssertionError("tests must not register a real device callback")
+
     def tearDown(self):
         localmute._endpoint = self._orig_ep
+        localmute._speakers = self._orig_speakers
         localmute._marker_path = self._orig_marker
+        localmute.AudioUtilities.GetDeviceEnumerator = self._orig_enum
 
 
 class _FakePath:
