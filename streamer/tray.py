@@ -130,7 +130,17 @@ class TrayApp:
         while True:
             try:
                 conn, _ = self._guard.accept()
-            except OSError:
+            except OSError as e:
+                # Nothing can be served after this, so drop the port too. Left
+                # bound, it would keep completing connections from the backlog:
+                # every later launch would "hand off" to a loop that is gone and
+                # exit silently. Closing it makes the next launch's bind()
+                # succeed and take ownership instead.
+                log.warning("instance control channel stopped: %s", e)
+                try:
+                    self._guard.close()
+                except OSError:
+                    pass
                 return
             try:
                 with conn:

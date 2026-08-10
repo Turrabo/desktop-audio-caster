@@ -17,7 +17,6 @@ import ctypes
 import logging
 import os
 import threading
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -178,12 +177,12 @@ class LoopbackCapture:
                     if data:
                         self._on_data(data)
                 except Exception as e:
-                    # Broad by necessity, exactly as in ProcessLoopbackCapture:
-                    # comtypes raises COMError on a failed HRESULT and COMError
-                    # is NOT an OSError subclass, so a device invalidated on
-                    # sleep/resume would slip through a narrower catch and kill
-                    # this thread with healthy still True - leaving the watchdog
-                    # blind and the cast playing pure silence.
+                    # Deliberately broad. PortAudio itself reports through
+                    # OSError, so the read is not the reason - _on_data is: it
+                    # runs the pacer and the whole sink chain on this thread,
+                    # and anything raised there used to kill capture silently
+                    # with healthy still True, leaving the watchdog blind and
+                    # the cast playing pure silence.
                     consecutive_errors += 1
                     log.warning("capture read error (%d): %s", consecutive_errors, e)
                     if consecutive_errors >= 5:

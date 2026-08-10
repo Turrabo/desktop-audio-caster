@@ -5,6 +5,11 @@ Real captured bytes fill that need; any shortfall is filled with EXACTLY the
 missing number of silence bytes. There is no second clock, so mute/unmute
 cycles cannot accumulate offset, and the stream never gaps (keep-alive +
 no receiver underrun).
+
+The one exception is a stall longer than MAX_CATCHUP_SECONDS - a suspend/resume
+or a pathological scheduler hiccup - where filling the gap would mean
+materialising minutes of silence in a single chunk. There the clock re-anchors
+and skips instead, trading a bounded discontinuity for a bounded allocation.
 """
 from __future__ import annotations
 
@@ -30,15 +35,19 @@ MAX_BACKLOG_SECONDS = 0.2    # captured audio older than this is dropped (bounds
 TRIM_CHECK_SECONDS = 5.0
 TRIM_RESIDUAL_SECONDS = 0.04  # jitter headroom left in place (2 ticks)
 
-# Ceiling on how much the clock will try to catch up in one tick. The pacer's
+# Gap beyond which the clock re-anchors instead of catching up. The pacer's
 # demand is derived from wall time since the cast started, so a long stall - a
 # suspend/resume, a pathological scheduler hiccup - asks for the WHOLE gap at
 # once, and the shortfall is materialised as literal silence bytes. Unclamped,
 # an hour's gap is a ~690 MB allocation (copied again by the silence gate and
-# again by the mirror's frame loop, under a lock). Past this ceiling the clock
-# re-anchors and skips the gap instead of filling it, which is what the rest of
-# this module already does to bound latency.
-MAX_CATCHUP_SECONDS = 0.5
+# again by the mirror's frame loop, under a lock). Past this the clock skips
+# the gap instead of filling it, which is what the rest of this module already
+# does to bound latency.
+#
+# A full second, not a fraction: below this, filling really is the right answer
+# (a 0.6 s hiccup is ordinary under load, and 0.6 s of silence bytes is only
+# ~115 KB), and skipping would put an avoidable discontinuity into the stream.
+MAX_CATCHUP_SECONDS = 1.0
 
 
 class Pacer:
@@ -80,6 +89,8 @@ class Pacer:
         next_trim = started + TRIM_CHECK_SECONDS
         max_catchup = int(MAX_CATCHUP_SECONDS * bps)
         max_catchup -= max_catchup % fb
+        tick_bytes = int(TICK_SECONDS * bps)
+        tick_bytes -= tick_bytes % fb
         while not self._stop.is_set():
             time.sleep(TICK_SECONDS)
             now = time.monotonic()
@@ -89,11 +100,13 @@ class Pacer:
                 continue
             if need > max_catchup:
                 # Skip the gap rather than emit it: re-anchor the emitted count
-                # so the next tick measures from here.
+                # so the next tick measures from here. Emit a single tick, not
+                # the whole ceiling - having decided to skip, there is no reason
+                # to hand downstream 25 ticks of mostly-silence in one call.
                 log.warning("pacer: %.1f s gap in the clock - skipping forward",
                             need / bps)
-                samples_emitted = target_samples - (max_catchup // fb)
-                need = max_catchup
+                need = tick_bytes
+                samples_emitted = target_samples - (need // fb)
                 self.skips += 1
             with self._lock:
                 take = min(need, len(self._fifo))
