@@ -1,16 +1,15 @@
-"""LocalMute's response to someone ELSE changing the endpoint (fakes, no COM).
+﻿"""LocalMute's response to someone ELSE changing the endpoint (fakes, no COM).
 
 The old design re-asserted its mute on a 5 s poll, so a mute key press leaked
 up to five seconds of audio into the room and was then silently overridden.
-Changes now arrive by notification and the default is to FOLLOW the user;
-holding the mute down is opt-in.
-"""
-import ctypes
-import json
-import time
-import unittest
+The poll is now 0.25 s and the default is to FOLLOW the user; holding the mute
+down is opt-in.
 
-from comtypes import GUID
+_speakers MUST stay patched alongside _endpoint, or these tests reach the
+machine's real audio device.
+"""
+import json
+import unittest
 
 import streamer.localmute as localmute
 
@@ -129,35 +128,34 @@ class TestFollowsTheUser(MuteBase):
         self.m.engage(pin=False, enforce=False)
         self.assertEqual(self.ep._mute, 1)
         self.ep._mute = 0                        # the user hit the mute key
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.assertEqual(self.ep._mute, 0)       # left alone
 
     def test_foreign_unmute_becomes_the_restore_target(self):
         """Leaving the endpoint where the user last put it beats restoring a
         pre-cast state they have since overridden."""
         self.m.engage(pin=False, enforce=False)
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.m.release()
         self.assertEqual(self.ep._mute, 0)
 
     def test_listener_is_told(self):
-        seen = []
-        self.m.arm(lambda muted, vol: seen.append((muted, vol)))
+        """_observe reports upward by RETURNING; the watch loop makes the call
+        outside the lock so a listener can never re-enter and deadlock."""
         self.m.engage(pin=False, enforce=False)
-        self.m._handle_foreign(muted=False, volume=0.4)
-        self.assertEqual(seen, [(False, 0.4)])
+        self.assertEqual(self.m._observe(muted=False, volume=0.4), (False, 0.4))
 
 
 class TestLockedMode(MuteBase):
     def test_foreign_unmute_is_undone(self):
         self.m.engage(pin=False, enforce=True)
         self.ep._mute = 0
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.assertEqual(self.ep._mute, 1)       # re-muted
 
     def test_prior_is_not_rewritten_by_our_own_correction(self):
         self.m.engage(pin=False, enforce=True)
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.m.release()
         self.assertEqual(self.ep._mute, 0)       # the true pre-cast state
 
@@ -170,14 +168,14 @@ class TestVolumePin(MuteBase):
         self.m.engage(pin=True, enforce=False)
         self.assertEqual(self.ep._vol, 1.0)
         self.ep._vol = 0.2
-        self.m._handle_foreign(muted=True, volume=0.2)
+        self.m._observe(muted=True, volume=0.2)
         self.assertEqual(self.ep._vol, 1.0)
 
     def test_dropping_the_pin_hands_volume_back(self):
         self.m.engage(pin=True, enforce=False)
         self.m.set_policy(pin=False)
         self.ep._vol = 0.2
-        self.m._handle_foreign(muted=True, volume=0.2)
+        self.m._observe(muted=True, volume=0.2)
         self.assertEqual(self.ep._vol, 0.2)      # no longer defended
 
     def test_dropping_the_pin_stops_restoring_the_old_volume(self):
@@ -244,7 +242,7 @@ class TestRestoreTarget(MuteBase):
         held every unrelated volume event also reports muted=True. Treating that
         as 'the user wants mute' left the PC muted after the cast."""
         self.m.engage(pin=False, enforce=False)      # process-loopback path
-        self.m._handle_foreign(muted=True, volume=0.55)   # volume changed only
+        self.m._observe(muted=True, volume=0.55)   # volume changed only
         self.m.release()
         self.assertEqual(self.ep._mute, 0)           # pre-cast state
 
@@ -253,9 +251,9 @@ class TestRestoreTarget(MuteBase):
         sending audio back to the room, not asking to be left muted."""
         self.m.engage(pin=False, enforce=False)
         self.ep._mute = 0
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.ep._mute = 1
-        self.m._handle_foreign(muted=True, volume=0.4)
+        self.m._observe(muted=True, volume=0.4)
         self.m.release()
         self.assertEqual(self.ep._mute, 0)
 
@@ -265,20 +263,20 @@ class TestRestoreTarget(MuteBase):
         self.ep._mute = 1
         self.m.engage(pin=False, enforce=False)
         self.ep._mute = 0
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.m.release()
         self.assertEqual(self.ep._mute, 0)
 
     def test_untouched_mute_restores_pre_cast_muted_state(self):
         self.ep._mute = 1
         self.m.engage(pin=False, enforce=False)
-        self.m._handle_foreign(muted=True, volume=0.7)   # volume traffic only
+        self.m._observe(muted=True, volume=0.7)   # volume traffic only
         self.m.release()
         self.assertEqual(self.ep._mute, 1)
 
     def test_enforced_correction_is_not_user_intent(self):
         self.m.engage(pin=False, enforce=True)
-        self.m._handle_foreign(muted=False, volume=0.4)  # undone by the hold
+        self.m._observe(muted=False, volume=0.4)  # undone by the hold
         self.m.release()
         self.assertEqual(self.ep._mute, 0)
 
@@ -316,6 +314,7 @@ class TestPinWrites(MuteBase):
         self.m.engage(pin=True, enforce=False)
         self.m.set_policy(pin=False)              # user un-mutes
         self.ep._vol = 0.80                       # user picks their own level
+        self.m._poll_once()                       # the poll notices it
         self.m.set_policy(pin=True)               # user re-mutes
         self.assertEqual(self.ep._vol, 1.0)       # held again
         self.m.release()
@@ -329,14 +328,14 @@ class TestPinWrites(MuteBase):
         self.ep._vol = 0.30
         self.m.engage(pin=True, enforce=False)
         self.ep._mute = 0
-        self.m._handle_foreign(muted=False, volume=1.0)   # no owner callback
+        self.m._observe(muted=False, volume=1.0)   # no owner callback
         self.assertEqual(self.ep._vol, 0.30)
 
     def test_pin_defence_only_while_actually_pinned(self):
         self.m.engage(pin=True, enforce=False)
         self.m.set_policy(pin=False)
         self.ep._vol = 0.2
-        self.m._handle_foreign(muted=True, volume=0.2)
+        self.m._observe(muted=True, volume=0.2)
         self.assertEqual(self.ep._vol, 0.2)       # no longer defended
 
 
@@ -344,7 +343,7 @@ class TestReEngageAfterFollow(MuteBase):
     def _user_unmutes(self):
         """A real un-mute changes the endpoint and THEN notifies."""
         self.ep._mute = 0
-        self.m._handle_foreign(muted=False, volume=self.ep._vol)
+        self.m._observe(muted=False, volume=self.ep._vol)
 
     def test_reselecting_speakers_remutes(self):
         self.m.engage(pin=False, enforce=False)
@@ -384,26 +383,7 @@ class TestReEngageAfterFollow(MuteBase):
         self.assertEqual(self.ep._mute, 1)                 # back to pre-cast
 
 
-class TestArmRegisters(MuteBase):
-    """arm() must actually register. These used to pass while every arm() was
-    raising inside the COM thread and being swallowed."""
-
-    def test_arm_registers_both_watchers(self):
-        self.m.arm(lambda *a: None)
-        self.assertEqual(len(self.ep.callbacks), 1)
-        self.assertEqual(len(self.enum.callbacks), 1)
-
-    def test_disarm_unregisters_both(self):
-        self.m.arm(lambda *a: None)
-        self.m.disarm()
-        self.assertEqual(self.ep.callbacks, [])
-        self.assertEqual(self.enum.callbacks, [])
-
-    def test_arm_is_idempotent(self):
-        self.m.arm(lambda *a: None)
-        self.m.arm(lambda *a: None)
-        self.assertEqual(len(self.ep.callbacks), 1)
-
+class TestEngageFailure(MuteBase):
     def test_engage_failure_reaches_the_caller(self):
         """A mode promising silence must not report success and then not mute."""
         def boom(*_a, **_k):
@@ -413,81 +393,102 @@ class TestArmRegisters(MuteBase):
             self.m.engage(pin=False, enforce=False)
 
 
-class TestNotificationFiltering(MuteBase):
-    """Drive the real _VolumeWatch callback, not _handle_foreign directly, so
-    the event-context comparison the whole design rests on is exercised."""
+class TestPollLoop(MuteBase):
+    """Drive _poll_once - the real comparison - rather than only calling
+    _observe, so the read side is exercised too."""
 
-    def _watch(self):
-        self.m.arm(lambda *a: None)
+    def test_poll_reports_a_user_unmute(self):
         self.m.engage(pin=False, enforce=False)
-        return self.ep.callbacks[0]
+        self.m._poll_once()                      # baseline
+        self.ep._mute = 0                        # user hits the mute key
+        self.assertEqual(self.m._poll_once(), (False, 0.4))
 
-    def test_our_own_write_is_ignored(self):
-        watch = self._watch()
-        seen = []
-        self.m._on_foreign = lambda *a: seen.append(a)
-        watch.on_notify(0.5, 1, ctypes.pointer(localmute.APP_CTX), 2, [0.5, 0.5])
-        self.assertEqual(seen, [])
+    def test_poll_is_quiet_when_nothing_changes(self):
+        self.m.engage(pin=False, enforce=False)
+        self.m._poll_once()
+        self.assertIsNone(self.m._poll_once())
 
-    def test_a_foreign_write_is_delivered(self):
-        watch = self._watch()
-        seen = []
-        self.m._on_foreign = lambda *a: seen.append(a)
-        other = GUID("{11111111-2222-3333-4444-555555555555}")
-        watch.on_notify(0.5, 0, ctypes.pointer(other), 2, [0.5, 0.5])
-        for _ in range(200):                      # handled on the COM thread
-            if seen:
-                break
-            time.sleep(0.01)
-        self.assertEqual(seen, [(False, 0.5)])
+    def test_poll_does_not_report_our_own_mute(self):
+        """engage() records what it wrote, so the first poll must not mistake
+        our own mute for the user muting."""
+        self.m.engage(pin=False, enforce=False)
+        self.assertIsNone(self.m._poll_once())
 
-    def test_the_mute_key_reports_guid_null_and_counts_as_foreign(self):
-        watch = self._watch()
-        seen = []
-        self.m._on_foreign = lambda *a: seen.append(a)
-        watch.on_notify(0.5, 0, ctypes.pointer(GUID()), 2, [0.5, 0.5])
-        for _ in range(200):
-            if seen:
-                break
-            time.sleep(0.01)
-        self.assertEqual(seen, [(False, 0.5)])
+    def test_poll_reasserts_the_hold_in_locked_mode(self):
+        self.m.engage(pin=False, enforce=True)
+        self.m._poll_once()
+        self.ep._mute = 0
+        self.assertIsNone(self.m._poll_once())   # our correction, not intent
+        self.assertEqual(self.ep._mute, 1)
+
+    def test_poll_tracks_the_users_volume_while_unpinned(self):
+        self.m.engage(pin=False, enforce=False)
+        self.ep._vol = 0.66
+        self.m._poll_once()
+        self.m.release()
+        self.assertEqual(self.ep._vol, 0.66)
+
+    def test_watch_thread_starts_and_stops(self):
+        self.m.arm(lambda *a: None)
+        thread = self.m._thread
+        self.assertTrue(thread.is_alive())
+        self.m.disarm()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+
+    def test_arm_is_idempotent(self):
+        self.m.arm(lambda *a: None)
+        first = self.m._thread
+        self.m.arm(lambda *a: None)
+        self.assertIs(self.m._thread, first)
 
 
 class TestDeviceChange(MuteBase):
-    def test_role_filter_ignores_non_multimedia_roles(self):
-        seen = []
-        watch = localmute._DeviceWatch(seen.append)
-        watch.on_default_device_changed("eRender", 0, "eCommunications", 2, "dev-B")
-        watch.on_default_device_changed("eRender", 0, "eConsole", 0, "dev-B")
-        watch.on_default_device_changed("eCapture", 1, "eMultimedia", 1, "dev-B")
-        self.assertEqual(seen, [])
-        watch.on_default_device_changed("eRender", 0, "eMultimedia", 1, "dev-B")
-        self.assertEqual(seen, ["dev-B"])
+    def _switch_device(self, new_id="dev-B"):
+        """The default output becomes a different endpoint."""
+        self.other = FakeEndpoint(mute=0, vol=0.9)
+        localmute._speakers = lambda: FakeDevice(self.other, new_id)
+        return self.m._poll_once()
 
-    def test_same_device_id_is_a_no_op(self):
-        self.m.arm(lambda *a: None)
+    def test_same_device_is_not_treated_as_a_change(self):
         self.m.engage(pin=False, enforce=False)
-        before = self.ep._mute
-        self.m._handle_device_change(self.m._device_id)
-        self.assertEqual(self.ep._mute, before)
+        self.m._poll_once()
+        self.m._poll_once()
+        self.assertEqual(self.ep._mute, 1)
 
-    def test_re_engages_even_when_re_arming_fails(self):
-        self.m.arm(lambda *a: None)
+    def test_change_restores_the_old_device_and_takes_the_new_one(self):
         self.m.engage(pin=False, enforce=False)
-        boom = lambda: (_ for _ in ()).throw(OSError("device not ready"))
-        orig, localmute._speakers = localmute._speakers, boom
+        self.m._poll_once()
+        self._switch_device()
+        self.assertEqual(self.ep._mute, 0)        # old one put back
+        self.assertEqual(self.other._mute, 1)     # new one silenced
+
+    def test_change_carries_the_users_unmute(self):
+        self.m.engage(pin=False, enforce=False)
+        self.m._poll_once()
+        self.ep._mute = 0
+        self.m._poll_once()                       # user un-mutes, we follow
+        self._switch_device()
+        self.assertEqual(self.other._mute, 0)     # not silently re-muted
+
+    def test_a_failed_poll_changes_nothing(self):
+        """A transient resolve failure costs one cycle and nothing else - we
+        still hold the device we muted, so the next poll simply retries. The
+        previous design dropped the mute for the rest of the cast here."""
+        self.m.engage(pin=False, enforce=False)
+        self.m._poll_once()
+
+        def boom():
+            raise OSError("not ready")
+        original, localmute._speakers = localmute._speakers, boom
         try:
-            self.m._handle_device_change("dev-B")
+            with self.assertRaises(OSError):
+                self.m._poll_once()               # the watch loop catches this
         finally:
-            localmute._speakers = orig
+            localmute._speakers = original
+        self.assertTrue(self.m.engaged)           # still holding
         self.assertEqual(self.ep._mute, 1)        # still silent
-
-    def test_carries_the_users_unmute_to_the_new_device(self):
-        self.m.arm(lambda *a: None)
-        self.m.engage(pin=False, enforce=False)
-        self.m._handle_foreign(muted=False, volume=0.4)   # user un-mutes
-        self.m._handle_device_change("dev-B")
-        self.assertEqual(self.ep._mute, 0)        # not silently re-muted
+        self.assertIsNone(self.m._poll_once())    # and recovers
 
 
 class TestDoubleEngage(MuteBase):
@@ -501,7 +502,7 @@ class TestDoubleEngage(MuteBase):
         self.m.engage(pin=False, enforce=False)
         self.m.engage(pin=False, enforce=True)
         self.ep._mute = 0
-        self.m._handle_foreign(muted=False, volume=0.4)
+        self.m._observe(muted=False, volume=0.4)
         self.assertEqual(self.ep._mute, 1)        # now holding
 
     def test_release_twice_is_safe(self):
@@ -514,3 +515,4 @@ class TestDoubleEngage(MuteBase):
 
 if __name__ == "__main__":
     unittest.main()
+
