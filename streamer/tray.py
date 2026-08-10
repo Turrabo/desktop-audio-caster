@@ -28,6 +28,7 @@ from .ui.popover import Popover
 log = logging.getLogger(__name__)
 
 SINGLE_INSTANCE_PORT = 48765
+ACCEPT_RETRY_LIMIT = 5        # consecutive accept() failures before giving up
 
 # GM3-dark state tints for the standard Cast glyph
 COLORS = {
@@ -127,16 +128,29 @@ class TrayApp:
         connected and sent successfully, because the listening socket's backlog
         accepts it, so each one believed it had handed off and exited. The app
         became a permanent silent no-op until the orphan was killed by hand."""
+        failures = 0
         while True:
             try:
                 conn, _ = self._guard.accept()
+                failures = 0
             except OSError as e:
-                # Nothing can be served after this, so drop the port too. Left
-                # bound, it would keep completing connections from the backlog:
-                # every later launch would "hand off" to a loop that is gone and
-                # exit silently. Closing it makes the next launch's bind()
-                # succeed and take ownership instead.
-                log.warning("instance control channel stopped: %s", e)
+                # accept() can fail transiently - Winsock reports WSAECONNRESET
+                # when a queued connection is aborted before it is accepted,
+                # which is exactly what a localhost-probing security agent
+                # produces. Retry: giving the port up here would let a second
+                # instance bind and run recover_from_crash() against this one's
+                # live cast, which is worse than the no-op it would avoid.
+                if self._guard.fileno() == -1:
+                    return                      # socket closed - shutting down
+                failures += 1
+                if failures < ACCEPT_RETRY_LIMIT:
+                    log.debug("guard accept failed (%d): %s", failures, e)
+                    continue
+                # Persistent failure means the socket is unusable. Close it so
+                # the next launch can bind and take ownership, rather than
+                # leaving a bound port whose backlog swallows every handoff.
+                log.warning("instance control channel unusable, releasing the "
+                            "port after %d failures: %s", failures, e)
                 try:
                     self._guard.close()
                 except OSError:

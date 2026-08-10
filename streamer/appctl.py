@@ -355,9 +355,12 @@ class AppController:
         """The mute key as a first-class control of this app.
 
         In 'speakers' the initial mute is a starting position: un-muting means
-        "I want it at my desk too", so the cast keeps playing at full strength
-        and the PC becomes audible - i.e. live 'both' semantics - and the volume
-        pin is dropped so loudness is the user's again. Re-muting goes back.
+        "I want it at my desk too", so the PC becomes audible and the volume pin
+        is dropped so loudness is the user's again - live 'both' semantics.
+        Re-muting goes back. Note that on the endpoint-loopback path 'both' also
+        means the cast strength follows the PC volume, because handing the
+        volume back is precisely what lets it scale the capture again; only the
+        decoupled process-loopback path keeps the cast at full strength.
 
         In 'speakers_locked' LocalMute has already undone the change; there is
         nothing to follow, we just keep the UI honest."""

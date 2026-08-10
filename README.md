@@ -97,10 +97,15 @@ Two capture backends, chosen automatically at cast start:
 By default (output mode *Speakers only*) the local output endpoint is muted when
 casting starts, so only the speakers make sound. That mute is a starting
 position, not a lock: your mute key still works. Un-mute mid-cast and the app
-reads it as intent — this PC joins in, the speakers keep playing at full
-strength, and the volume is yours again; mute once more and it goes back. Pick
-*Speakers only (locked)* if you'd rather the room stayed silent whatever gets
-pressed, and the mute is re-asserted instead.
+reads it as intent — this PC joins in and the volume is yours again; mute once
+more and it goes back. Pick *Speakers only (locked)* if you'd rather the room
+stayed silent whatever gets pressed, and the mute is re-asserted instead.
+
+On the process-loopback path the cast keeps playing at full strength through
+all of that. On the endpoint-loopback fallback it cannot: handing the volume
+back is the same thing as letting it scale the capture, so the room follows
+your PC volume once you un-mute — the behaviour *Both* documents. Turn the PC
+volume down there and the speakers go quiet with it.
 
 Endpoint changes arrive as WASAPI notifications
 (`IAudioEndpointVolumeCallback`), not by polling, so the reaction is a few
