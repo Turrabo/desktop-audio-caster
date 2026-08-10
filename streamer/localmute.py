@@ -171,9 +171,19 @@ class _DeviceWatch(MMNotificationClient):
         super().__init__()
         self._on_changed = on_default_render_changed
 
+    # AudioUtilities.GetSpeakers() resolves eRender + eMultimedia specifically,
+    # so only that pairing describes the device we actually hold. The
+    # notification fires once PER ROLE, and the eCommunications default is
+    # routinely a different device (a headset), so reacting to every role would
+    # churn - releasing and re-engaging the same endpoint, un-muting audibly
+    # each time - and never settle, because re-arming always resolves the
+    # multimedia default straight back.
+    WATCHED_FLOW = "eRender"
+    WATCHED_ROLE = "eMultimedia"
+
     def on_default_device_changed(self, flow, flow_id, role, role_id,
                                   default_device_id):
-        if str(flow) == "eRender":
+        if str(flow) == self.WATCHED_FLOW and str(role) == self.WATCHED_ROLE:
             self._on_changed(default_device_id)
 
 
@@ -189,8 +199,22 @@ class LocalMute:
         self._enum = None
         self._dev_cb = None
         self._device_id: str | None = None
+        # IMMUTABLE snapshot of the endpoint as we found it. Never rewritten
+        # while a cast runs: it answers "what was here before us", and nothing
+        # else. Conflating it with "what the user wants now" is how an earlier
+        # version left the PC muted after a cast - any notification arriving
+        # while our own mute was in effect looked like the user asking for mute.
         self._prior: dict | None = None
-        self._pin = False
+        # True once the user has taken the endpoint OUT of the mute we put it
+        # in. Only an un-mute counts: we always mute, so a later re-mute is the
+        # user cancelling their own override (they are sending audio back to the
+        # room), not a new preference about where to leave the endpoint. Set
+        # only on an OBSERVED CHANGE, so our own writes and unrelated volume
+        # traffic can never masquerade as intent.
+        self._user_unmuted = False
+        self._last_mute: bool | None = None   # last mute state we wrote or saw
+        self._pin = False                     # policy: should we hold 100%
+        self._pinned_now = False              # fact: are we holding it
         self._enforce = False
         self._on_foreign = None
 
@@ -302,65 +326,105 @@ class LocalMute:
         log.debug("endpoint watch armed on %s", self._device_id)
 
     def _do_engage(self, pin: bool, enforce: bool) -> None:
-        self._pin, self._enforce = pin, enforce
         if self._prior is not None:
-            # Already engaged (e.g. re-selecting "speakers" while in it).
-            # Re-capturing _prior here would record the ALREADY-muted state and
-            # leave the PC muted after release.
-            log.debug("engage() while already engaged - policy updated only")
+            # Already engaged. Re-capturing _prior here would record the
+            # ALREADY-muted state and leave the PC muted after release. But the
+            # user may have un-muted and been followed, so re-selecting a
+            # speakers mode has to actually re-assert the mute - otherwise the
+            # UI reports "muted" over an audible PC, and the mode the user just
+            # picked does nothing until they next touch the mute key.
+            # Re-assert the mute BEFORE applying policy. Re-enabling the pin
+            # writes the volume to 100%, and doing that while the user currently
+            # has us un-muted would be an audible full-volume blast - the same
+            # "mute first, then raise volume" invariant the fresh path keeps.
+            if self._last_mute is False:
+                log.info("speakers mode re-selected while following - re-muting")
+                self._safe_write(lambda v: v.SetMute(1, APP_CTX))
+                self._last_mute = True
+                self._user_unmuted = False   # an explicit pick supersedes it
+            self._do_set_policy(pin, enforce)
+            self._write_marker()
             return
         vol = self._vol if self._vol is not None else _endpoint()
+        self._pin, self._enforce = pin, enforce
         self._prior = {"mute": vol.GetMute(),
-                       "volume": vol.GetMasterVolumeLevelScalar(),
-                       "pin": pin}
-        try:
-            _marker_path().write_text(json.dumps(self._prior), encoding="utf-8")
-        except OSError as e:
-            log.warning("could not write mute marker: %s", e)
+                       "volume": vol.GetMasterVolumeLevelScalar()}
+        self._user_unmuted = False
         # Order matters: mute FIRST, then raise volume - never audible.
         vol.SetMute(1, APP_CTX)
+        self._last_mute = True
         if pin:
             vol.SetMasterVolumeLevelScalar(1.0, APP_CTX)
+            self._pinned_now = True
+        self._write_marker()
         atexit.register(self._atexit_restore)
         log.info("local output muted%s%s (was mute=%s vol=%.2f)",
                  ", volume pinned to 100%" if pin else "",
                  ", held" if enforce else "",
                  self._prior["mute"], self._prior["volume"])
 
+    def _restore_target(self) -> dict:
+        """What release() should put back: the pre-cast snapshot, unless the user
+        overrode our mute and never took it back - having deliberately un-muted,
+        they should not be re-muted when the cast ends."""
+        if self._prior is None:
+            return {}
+        mute = 0 if self._user_unmuted else int(self._prior["mute"])
+        return {"mute": int(mute), "volume": float(self._prior["volume"]),
+                "pin": bool(self._pinned_now)}
+
     def _write_marker(self) -> None:
         if self._prior is None:
             return
         try:
-            _marker_path().write_text(json.dumps(self._prior), encoding="utf-8")
+            _marker_path().write_text(json.dumps(self._restore_target()),
+                                      encoding="utf-8")
         except OSError as e:
             log.debug("marker rewrite failed: %s", e)
 
     def _do_set_policy(self, pin, enforce) -> None:
-        if pin is not None and pin != self._pin:
-            self._pin = bool(pin)
-            if self._prior is not None and not self._pin:
-                # Stopped pinning, so the live volume is the user's again and
-                # restoring our saved one on release would undo their change.
-                self._prior["pin"] = False
-                self._write_marker()
-            log.info("volume pin %s", "on" if pin else "off")
         if enforce is not None and enforce != self._enforce:
             self._enforce = bool(enforce)
             log.info("mute hold %s", "on" if enforce else "off")
+        if pin is None or bool(pin) == self._pin:
+            return
+        self._pin = bool(pin)
+        log.info("volume pin %s", "on" if self._pin else "off")
+        if self._prior is None:
+            return
+        # The flag alone is not enough - it only takes effect on the next
+        # notification, which may never come. Both directions must WRITE.
+        if self._pin and not self._pinned_now:
+            self._safe_write(lambda v: v.SetMasterVolumeLevelScalar(1.0, APP_CTX))
+            self._pinned_now = True
+        elif not self._pin and self._pinned_now:
+            # Hand back the user's OWN level. The endpoint currently holds our
+            # pinned 1.0, so simply letting go would leave them at full volume -
+            # a blast the moment they un-mute, and their real level lost for good.
+            self._safe_write(lambda v: v.SetMasterVolumeLevelScalar(
+                float(self._prior["volume"]), APP_CTX))
+            self._pinned_now = False
+        self._write_marker()
 
     def _do_release(self) -> None:
         if self._prior is None:
             return
-        prior, self._prior = self._prior, None
+        target = self._restore_target()
+        self._prior = None
+        pinned, self._pinned_now = self._pinned_now, False
+        self._user_unmuted = False
+        self._last_mute = None
         try:
             vol = self._vol if self._vol is not None else _endpoint()
-            # Restore volume FIRST (while still muted) but only if we pinned it;
-            # on the decoupled path the user's live volume is left as-is.
-            if prior.get("pin", True):
-                vol.SetMasterVolumeLevelScalar(float(prior["volume"]), APP_CTX)
-            vol.SetMute(int(prior["mute"]), APP_CTX)
-            log.info("local output restored (mute=%s vol=%.2f pin=%s)",
-                     prior["mute"], prior["volume"], prior.get("pin", True))
+            # Restore volume FIRST (while still muted) and only if we are still
+            # holding it. If the pin was dropped mid-cast the user's level was
+            # already handed back at that moment, and whatever they set since is
+            # theirs to keep.
+            if pinned:
+                vol.SetMasterVolumeLevelScalar(float(target["volume"]), APP_CTX)
+            vol.SetMute(int(target["mute"]), APP_CTX)
+            log.info("local output restored (mute=%s vol=%.2f pinned=%s)",
+                     target["mute"], target["volume"], pinned)
         except Exception as e:
             log.warning("endpoint restore failed: %s", e)
         _marker_path().unlink(missing_ok=True)
@@ -402,24 +466,28 @@ class LocalMute:
 
     def _handle_foreign(self, muted: bool, volume: float) -> None:
         if self._prior is not None:
+            previous, self._last_mute = self._last_mute, muted
             if self._enforce and not muted:
                 log.info("endpoint un-muted mid-cast - re-muting (hold on)")
                 self._safe_write(lambda v: v.SetMute(1, APP_CTX))
+                self._last_mute = True
                 muted = True
-            # Mechanism, not policy: on the coupled capture path a volume drop
-            # would silently kill the cast, and the user cannot be expressing an
-            # intent about loudness they can't hear while muted.
-            if self._pin and muted and volume < 0.999:
-                log.info("endpoint volume dropped while muted - re-pinning 100%%")
-                self._safe_write(lambda v: v.SetMasterVolumeLevelScalar(1.0, APP_CTX))
-            elif not self._enforce:
-                # Not holding anything down, so what the user just chose becomes
-                # the restore target: at cast end the endpoint should be left
-                # where THEY last put it, not where it was before the cast.
-                self._prior["mute"] = int(muted)
-                if not self._pin:
-                    self._prior["volume"] = float(volume)
-                self._write_marker()
+            else:
+                # Record intent only on an OBSERVED CHANGE of the mute. The
+                # notification carries the endpoint's CURRENT state, so while we
+                # hold our own mute every unrelated volume event also reports
+                # muted=True; treating that as the user asking for mute is what
+                # used to leave the PC muted after the cast.
+                if previous is not None and muted != previous:
+                    self._user_unmuted = not muted
+                    self._write_marker()
+                # Mechanism, not policy: on the coupled capture path a volume
+                # drop would silently kill the cast, and the user cannot be
+                # expressing an intent about loudness they can't hear.
+                if self._pinned_now and muted and volume < 0.999:
+                    log.info("endpoint volume dropped while muted - re-pinning 100%%")
+                    self._safe_write(
+                        lambda v: v.SetMasterVolumeLevelScalar(1.0, APP_CTX))
         cb = self._on_foreign
         if cb is not None:
             try:
@@ -432,13 +500,38 @@ class LocalMute:
             return
         log.info("default output changed mid-cast (%s -> %s)",
                  self._device_id, device_id)
-        was_engaged, pin, enforce = self._prior is not None, self._pin, self._enforce
-        # Restore and unregister the OLD endpoint, then re-arm on the new one.
+        was_engaged = self._prior is not None
+        pin, enforce = self._pin, self._enforce
+        # Carry the user's override across: if they had un-muted and we were
+        # following them, moving to a new device must not silently re-mute them.
+        carried_user_unmuted = self._user_unmuted
         on_foreign = self._on_foreign
-        self._do_disarm()
-        self._do_arm(on_foreign)
-        if was_engaged:
+        # Each step is guarded separately. Re-arming the watcher is the most
+        # failure-prone part (the new device may not be ready yet), and if it
+        # took the mute down with it the whole point of the mode would be lost
+        # for the rest of the cast - so engaging must still happen either way.
+        try:
+            self._do_disarm()           # restores + unregisters the old device
+        except Exception as e:
+            log.warning("releasing the old default failed: %s", e)
+        try:
+            self._do_arm(on_foreign)
+        except Exception as e:
+            log.warning("re-arming on the new default failed (%s); the endpoint "
+                        "is still controlled, but changes are no longer watched", e)
+        if not was_engaged:
+            return
+        try:
             self._do_engage(pin, enforce)
+        except Exception as e:
+            log.warning("re-engaging on the new default failed: %s", e)
+            return
+        if carried_user_unmuted and not enforce:
+            log.info("carrying the user's un-mute onto the new default")
+            self._safe_write(lambda v: v.SetMute(0, APP_CTX))
+            self._last_mute = False
+            self._user_unmuted = True
+            self._write_marker()
 
     def _safe_write(self, fn) -> None:
         try:
@@ -453,14 +546,16 @@ class LocalMute:
         the registration or the COM thread (which may already be gone): it just
         puts the endpoint back with a fresh handle. os._exit() skips atexit
         entirely, which is what the marker file is for."""
-        prior, self._prior = self._prior, None
-        if prior is None:
+        if self._prior is None:
             return
+        target = self._restore_target()
+        pinned, self._pinned_now = self._pinned_now, False
+        self._prior = None
         try:
             vol = _endpoint()
-            if prior.get("pin", True):
-                vol.SetMasterVolumeLevelScalar(float(prior["volume"]), APP_CTX)
-            vol.SetMute(int(prior["mute"]), APP_CTX)
+            if pinned:
+                vol.SetMasterVolumeLevelScalar(float(target["volume"]), APP_CTX)
+            vol.SetMute(int(target["mute"]), APP_CTX)
         except Exception as e:
             log.warning("atexit endpoint restore failed: %s", e)
         _marker_path().unlink(missing_ok=True)
