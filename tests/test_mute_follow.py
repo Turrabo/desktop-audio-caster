@@ -5,17 +5,27 @@ up to five seconds of audio into the room and was then silently overridden.
 Changes now arrive by notification and the default is to FOLLOW the user;
 holding the mute down is opt-in.
 """
+import ctypes
 import json
+import time
 import unittest
+
+from comtypes import GUID
 
 import streamer.localmute as localmute
 
 
 class FakeEndpoint:
+    """Includes the notification registration methods. Without them every
+    arm() in the suite raised inside the COM thread and was swallowed, so the
+    watcher was never actually registered and the tests that claimed to cover
+    the armed paths were silently exercising the failure branch instead."""
+
     def __init__(self, mute=0, vol=0.5):
         self._mute = mute
         self._vol = vol
         self.writes = []
+        self.callbacks = []
 
     def GetMute(self):
         return self._mute
@@ -30,6 +40,13 @@ class FakeEndpoint:
     def SetMasterVolumeLevelScalar(self, v, ctx):
         self._vol = v
         self.writes.append(("vol", v, ctx))
+
+    def RegisterControlChangeNotify(self, cb):
+        self.callbacks.append(cb)
+
+    def UnregisterControlChangeNotify(self, cb):
+        if cb in self.callbacks:
+            self.callbacks.remove(cb)
 
 
 class _FakePath:
@@ -57,6 +74,21 @@ class FakeDevice:
         self.id = device_id
 
 
+class FakeEnumerator:
+    """Records device-notification registrations instead of reaching the real
+    MMDeviceEnumerator, so that path is exercised rather than skipped."""
+
+    def __init__(self):
+        self.callbacks = []
+
+    def RegisterEndpointNotificationCallback(self, cb):
+        self.callbacks.append(cb)
+
+    def UnregisterEndpointNotificationCallback(self, cb):
+        if cb in self.callbacks:
+            self.callbacks.remove(cb)
+
+
 class MuteBase(unittest.TestCase):
     """Isolates the tests from the machine's real audio device.
 
@@ -75,14 +107,11 @@ class MuteBase(unittest.TestCase):
         self._orig_enum = localmute.AudioUtilities.GetDeviceEnumerator
         localmute._endpoint = lambda: self.ep
         localmute._speakers = lambda: FakeDevice(self.ep)
-        localmute.AudioUtilities.GetDeviceEnumerator = self._no_enumerator
+        self.enum = FakeEnumerator()
+        localmute.AudioUtilities.GetDeviceEnumerator = lambda: self.enum
         self._marker = {}
         localmute._marker_path = lambda: _FakePath(self._marker)
         self.m = localmute.LocalMute()
-
-    @staticmethod
-    def _no_enumerator():
-        raise AssertionError("tests must not register a real device callback")
 
     def tearDown(self):
         try:
@@ -162,6 +191,37 @@ class TestVolumePin(MuteBase):
         self.m.engage(pin=True, enforce=False)
         self.m.set_policy(pin=False)
         self.assertFalse(json.loads(self._marker["text"])["pin"])
+
+
+class TestMarkerOrdering(MuteBase):
+    """The recovery marker goes down BEFORE the endpoint is touched. Muting with
+    no marker is the one combination that can leave a machine silently muted
+    forever: a hard kill skips atexit and the next launch has nothing to
+    restore from."""
+
+    def _break_marker(self):
+        class DeadPath:
+            def write_text(self, _t, encoding=None):
+                raise OSError("disk full")
+
+            def exists(self):
+                return False
+
+            def unlink(self, missing_ok=False):
+                pass
+        localmute._marker_path = lambda: DeadPath()
+
+    def test_engage_fails_rather_than_muting_without_a_marker(self):
+        self._break_marker()
+        with self.assertRaises(OSError):
+            self.m.engage(pin=True, enforce=False)
+        self.assertEqual(self.ep._mute, 0)        # never touched
+        self.assertEqual(self.ep._vol, 0.4)       # never pinned
+        self.assertFalse(self.m.engaged)
+
+    def test_marker_describes_the_pinned_state_it_is_about_to_create(self):
+        self.m.engage(pin=True, enforce=False)
+        self.assertTrue(json.loads(self._marker["text"])["pin"])
 
 
 class TestWriteTagging(MuteBase):
@@ -248,6 +308,30 @@ class TestPinWrites(MuteBase):
         self.m.set_policy(pin=True)
         self.assertEqual(self.ep._vol, 1.0)
 
+    def test_retaking_the_pin_snapshots_the_users_level(self):
+        """While un-pinned the user may pick their own level. Re-taking the pin
+        overwrites it with 100%, so it has to be captured first - otherwise
+        release() hands back the stale pre-cast value and their choice is gone."""
+        self.ep._vol = 0.30
+        self.m.engage(pin=True, enforce=False)
+        self.m.set_policy(pin=False)              # user un-mutes
+        self.ep._vol = 0.80                       # user picks their own level
+        self.m.set_policy(pin=True)               # user re-mutes
+        self.assertEqual(self.ep._vol, 1.0)       # held again
+        self.m.release()
+        self.assertEqual(self.ep._vol, 0.80)      # theirs, not the stale 0.30
+
+    def test_unmute_drops_the_pin_without_waiting_for_the_owner(self):
+        """The corrective write must happen on the notification thread. Routed
+        through the app's ops worker it lands whenever that worker is next
+        free - seconds during a cast connect - and until then the user is
+        un-muted at our pinned 100%."""
+        self.ep._vol = 0.30
+        self.m.engage(pin=True, enforce=False)
+        self.ep._mute = 0
+        self.m._handle_foreign(muted=False, volume=1.0)   # no owner callback
+        self.assertEqual(self.ep._vol, 0.30)
+
     def test_pin_defence_only_while_actually_pinned(self):
         self.m.engage(pin=True, enforce=False)
         self.m.set_policy(pin=False)
@@ -298,6 +382,75 @@ class TestReEngageAfterFollow(MuteBase):
         self.m.engage(pin=False, enforce=False)            # re-picks speakers
         self.m.release()
         self.assertEqual(self.ep._mute, 1)                 # back to pre-cast
+
+
+class TestArmRegisters(MuteBase):
+    """arm() must actually register. These used to pass while every arm() was
+    raising inside the COM thread and being swallowed."""
+
+    def test_arm_registers_both_watchers(self):
+        self.m.arm(lambda *a: None)
+        self.assertEqual(len(self.ep.callbacks), 1)
+        self.assertEqual(len(self.enum.callbacks), 1)
+
+    def test_disarm_unregisters_both(self):
+        self.m.arm(lambda *a: None)
+        self.m.disarm()
+        self.assertEqual(self.ep.callbacks, [])
+        self.assertEqual(self.enum.callbacks, [])
+
+    def test_arm_is_idempotent(self):
+        self.m.arm(lambda *a: None)
+        self.m.arm(lambda *a: None)
+        self.assertEqual(len(self.ep.callbacks), 1)
+
+    def test_engage_failure_reaches_the_caller(self):
+        """A mode promising silence must not report success and then not mute."""
+        def boom(*_a, **_k):
+            raise OSError("endpoint gone")
+        self.ep.GetMute = boom
+        with self.assertRaises(OSError):
+            self.m.engage(pin=False, enforce=False)
+
+
+class TestNotificationFiltering(MuteBase):
+    """Drive the real _VolumeWatch callback, not _handle_foreign directly, so
+    the event-context comparison the whole design rests on is exercised."""
+
+    def _watch(self):
+        self.m.arm(lambda *a: None)
+        self.m.engage(pin=False, enforce=False)
+        return self.ep.callbacks[0]
+
+    def test_our_own_write_is_ignored(self):
+        watch = self._watch()
+        seen = []
+        self.m._on_foreign = lambda *a: seen.append(a)
+        watch.on_notify(0.5, 1, ctypes.pointer(localmute.APP_CTX), 2, [0.5, 0.5])
+        self.assertEqual(seen, [])
+
+    def test_a_foreign_write_is_delivered(self):
+        watch = self._watch()
+        seen = []
+        self.m._on_foreign = lambda *a: seen.append(a)
+        other = GUID("{11111111-2222-3333-4444-555555555555}")
+        watch.on_notify(0.5, 0, ctypes.pointer(other), 2, [0.5, 0.5])
+        for _ in range(200):                      # handled on the COM thread
+            if seen:
+                break
+            time.sleep(0.01)
+        self.assertEqual(seen, [(False, 0.5)])
+
+    def test_the_mute_key_reports_guid_null_and_counts_as_foreign(self):
+        watch = self._watch()
+        seen = []
+        self.m._on_foreign = lambda *a: seen.append(a)
+        watch.on_notify(0.5, 0, ctypes.pointer(GUID()), 2, [0.5, 0.5])
+        for _ in range(200):
+            if seen:
+                break
+            time.sleep(0.01)
+        self.assertEqual(seen, [(False, 0.5)])
 
 
 class TestDeviceChange(MuteBase):

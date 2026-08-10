@@ -215,6 +215,11 @@ class LocalMute:
         self._last_mute: bool | None = None   # last mute state we wrote or saw
         self._pin = False                     # policy: should we hold 100%
         self._pinned_now = False              # fact: are we holding it
+        # The volume release() should hand back. Starts as the pre-cast level
+        # but is re-snapshotted whenever we TAKE the pin, because by then the
+        # user may have chosen their own level while we were not holding it -
+        # restoring the pre-cast value would silently discard that choice.
+        self._volume_target = 1.0
         self._enforce = False
         self._on_foreign = None
 
@@ -229,8 +234,12 @@ class LocalMute:
     def engage(self, pin: bool = True, enforce: bool = False) -> None:
         """Mute the endpoint once, recording the prior state. When pin is True
         also hold the volume at 100% - needed only on the endpoint capture path
-        where volume scales the capture."""
-        self._call(lambda: self._do_engage(bool(pin), bool(enforce)))
+        where volume scales the capture.
+
+        Raises if the endpoint could not be taken. A mode whose promise is
+        "this PC stays quiet" must not report success and then not mute."""
+        self._call(lambda: self._do_engage(bool(pin), bool(enforce)),
+                   propagate=True)
 
     def set_policy(self, pin: bool | None = None, enforce: bool | None = None) -> None:
         """Adjust the live hold without tearing it down (e.g. dropping the pin
@@ -249,6 +258,10 @@ class LocalMute:
         self._stop.set()
         self._cmds.put(None)          # wake the loop so it can exit
         self._thread.join(timeout=_COMMAND_TIMEOUT)
+        if self._thread.is_alive():
+            # Safe to abandon: the next thread gets its own queue and stop
+            # event, so a wedged one cannot consume or block its work.
+            log.warning("endpoint COM thread did not exit; abandoning it")
         self._thread = None
 
     @property
@@ -260,39 +273,75 @@ class LocalMute:
     def _ensure_thread(self) -> None:
         """Start the COM thread on first use. Lazy rather than required, so
         engage()/release() work standalone - a caller that never armed still
-        gets its mute, instead of a silent no-op."""
+        gets its mute, instead of a silent no-op.
+
+        Each thread gets its OWN queue and stop event. Sharing them meant
+        disarm()'s shutdown sentinel could survive unconsumed - the loop
+        re-tests the stop flag before every get(), so any command arriving in
+        that window is pulled first and the sentinel is left behind - and the
+        NEXT thread would then read it as its own instruction to exit, making
+        that cast's first command a two-second no-op.
+        """
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="endpoint-com",
-                                        daemon=True)
+        self._stop = threading.Event()
+        self._cmds = queue.Queue()
+        cmds, stop = self._cmds, self._stop
+        self._thread = threading.Thread(target=lambda: self._run(cmds, stop),
+                                        name="endpoint-com", daemon=True)
         self._thread.start()
 
-    def _call(self, fn) -> None:
+    def _call(self, fn, propagate: bool = False) -> None:
         """Run fn on the COM thread and wait for it. Waiting keeps cast teardown
         ordered (the mute must really be gone before we report IDLE) and lets
-        callers stay COM-free."""
+        callers stay COM-free.
+
+        propagate=True re-raises the command's exception on the calling thread.
+        Used where failing silently would leave the app claiming something it is
+        not doing - engage in particular, since a mode whose whole promise is
+        "this PC stays quiet" must not report success and then not mute.
+        Teardown paths leave it False: a release that fails should be logged,
+        never allowed to break the rest of the teardown.
+        """
         self._ensure_thread()
         done = threading.Event()
-        self._cmds.put((fn, done))
+        box: list = []
+        self._cmds.put((fn, done, box))
         if not done.wait(_COMMAND_TIMEOUT):
             log.warning("endpoint command timed out after %.0fs", _COMMAND_TIMEOUT)
+            if propagate:
+                raise TimeoutError("endpoint command timed out")
+            return
+        if box and propagate:
+            raise box[0]
 
-    def _run(self) -> None:
+    def _run(self, cmds: queue.Queue, stop: threading.Event) -> None:
         comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
         try:
-            while not self._stop.is_set():
-                item = self._cmds.get()
+            while not stop.is_set():
+                item = cmds.get()
                 if item is None:
                     break
-                fn, done = item
+                fn, done, box = item
                 try:
                     fn()
                 except Exception as e:
                     log.warning("endpoint command failed: %s", e)
+                    box.append(e)
                 finally:
                     done.set()
         finally:
+            # Release anyone still waiting rather than let them burn the full
+            # timeout, and tell them the work did not run.
+            while True:
+                try:
+                    item = cmds.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    _fn, done, box = item
+                    box.append(RuntimeError("endpoint thread shut down"))
+                    done.set()
             try:
                 self._do_disarm()
             except Exception:
@@ -349,14 +398,28 @@ class LocalMute:
         self._pin, self._enforce = pin, enforce
         self._prior = {"mute": vol.GetMute(),
                        "volume": vol.GetMasterVolumeLevelScalar()}
+        self._volume_target = float(self._prior["volume"])
         self._user_unmuted = False
+        self._pinned_now = bool(pin)      # intent, so the marker describes the
+                                          # state the endpoint is about to be in
+        # The marker goes down BEFORE any endpoint write, and a failure here is
+        # fatal to the engage rather than logged and ignored. Muting with no
+        # recovery marker is the one combination that can leave a machine
+        # silently muted forever: a hard kill (including shutdown()'s os._exit
+        # bail) skips atexit, and the next launch has nothing to restore from.
+        # Better to fail the cast loudly with the PC still audible.
+        try:
+            _marker_path().write_text(json.dumps(self._restore_target()),
+                                      encoding="utf-8")
+        except OSError:
+            self._prior = None
+            self._pinned_now = False
+            raise
         # Order matters: mute FIRST, then raise volume - never audible.
         vol.SetMute(1, APP_CTX)
         self._last_mute = True
         if pin:
             vol.SetMasterVolumeLevelScalar(1.0, APP_CTX)
-            self._pinned_now = True
-        self._write_marker()
         atexit.register(self._atexit_restore)
         log.info("local output muted%s%s (was mute=%s vol=%.2f)",
                  ", volume pinned to 100%" if pin else "",
@@ -370,7 +433,7 @@ class LocalMute:
         if self._prior is None:
             return {}
         mute = 0 if self._user_unmuted else int(self._prior["mute"])
-        return {"mute": int(mute), "volume": float(self._prior["volume"]),
+        return {"mute": int(mute), "volume": float(self._volume_target),
                 "pin": bool(self._pinned_now)}
 
     def _write_marker(self) -> None:
@@ -382,29 +445,47 @@ class LocalMute:
         except OSError as e:
             log.debug("marker rewrite failed: %s", e)
 
-    def _do_set_policy(self, pin, enforce) -> None:
-        if enforce is not None and enforce != self._enforce:
-            self._enforce = bool(enforce)
-            log.info("mute hold %s", "on" if enforce else "off")
-        if pin is None or bool(pin) == self._pin:
+    def _read_volume(self) -> float | None:
+        try:
+            vol = self._vol if self._vol is not None else _endpoint()
+            return float(vol.GetMasterVolumeLevelScalar())
+        except Exception as e:
+            log.debug("volume read failed: %s", e)
+            return None
+
+    def _apply_pin(self, enabled: bool) -> None:
+        """Take or release the 100% hold, WRITING the endpoint each time.
+
+        Setting a flag is not enough: it would only take effect on the next
+        notification, which may never arrive. Taking the pin also re-snapshots
+        the level the user is currently on, so release() hands back what they
+        last chose rather than a stale pre-cast value.
+        """
+        enabled = bool(enabled)
+        self._pin = enabled
+        if self._prior is None or enabled == self._pinned_now:
             return
-        self._pin = bool(pin)
-        log.info("volume pin %s", "on" if self._pin else "off")
-        if self._prior is None:
-            return
-        # The flag alone is not enough - it only takes effect on the next
-        # notification, which may never come. Both directions must WRITE.
-        if self._pin and not self._pinned_now:
+        if enabled:
+            current = self._read_volume()
+            if current is not None:
+                self._volume_target = current
             self._safe_write(lambda v: v.SetMasterVolumeLevelScalar(1.0, APP_CTX))
-            self._pinned_now = True
-        elif not self._pin and self._pinned_now:
+        else:
             # Hand back the user's OWN level. The endpoint currently holds our
             # pinned 1.0, so simply letting go would leave them at full volume -
             # a blast the moment they un-mute, and their real level lost for good.
             self._safe_write(lambda v: v.SetMasterVolumeLevelScalar(
-                float(self._prior["volume"]), APP_CTX))
-            self._pinned_now = False
+                float(self._volume_target), APP_CTX))
+        self._pinned_now = enabled
+        log.info("volume pin %s", "on" if enabled else "off")
         self._write_marker()
+
+    def _do_set_policy(self, pin, enforce) -> None:
+        if enforce is not None and enforce != self._enforce:
+            self._enforce = bool(enforce)
+            log.info("mute hold %s", "on" if enforce else "off")
+        if pin is not None:
+            self._apply_pin(pin)
 
     def _do_release(self) -> None:
         if self._prior is None:
@@ -427,7 +508,13 @@ class LocalMute:
                      target["mute"], target["volume"], pinned)
         except Exception as e:
             log.warning("endpoint restore failed: %s", e)
-        _marker_path().unlink(missing_ok=True)
+        self._volume_target = 1.0
+        # Both of these must run even if the restore above threw, and a failure
+        # to clear the marker must not hide the atexit unregister behind it.
+        try:
+            _marker_path().unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("could not clear the mute marker: %s", e)
         try:
             atexit.unregister(self._atexit_restore)
         except Exception:
@@ -458,11 +545,11 @@ class LocalMute:
         """Called on an OS pool thread by _VolumeWatch (already filtered to
         foreign changes). Enqueue rather than act here."""
         self._cmds.put((lambda: self._handle_foreign(muted, volume),
-                        threading.Event()))
+                        threading.Event(), []))
 
     def _on_device_event(self, device_id) -> None:
         self._cmds.put((lambda: self._handle_device_change(device_id),
-                        threading.Event()))
+                        threading.Event(), []))
 
     def _handle_foreign(self, muted: bool, volume: float) -> None:
         if self._prior is not None:
@@ -480,6 +567,14 @@ class LocalMute:
                 # used to leave the PC muted after the cast.
                 if previous is not None and muted != previous:
                     self._user_unmuted = not muted
+                    if not muted and self._pinned_now:
+                        # Release the hold HERE, on this thread. Routing it
+                        # through the app's ops worker means it lands whenever
+                        # that worker is next free - which is seconds while a
+                        # cast is connecting - and until then the user is
+                        # un-muted at our pinned 100%. The owner still asks for
+                        # the same thing a moment later; that call is a no-op.
+                        self._apply_pin(False)
                     self._write_marker()
                 # Mechanism, not policy: on the coupled capture path a volume
                 # drop would silently kill the cast, and the user cannot be

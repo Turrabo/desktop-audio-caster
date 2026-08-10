@@ -27,11 +27,25 @@ class FakeEndpoint:
     def SetMasterVolumeLevelScalar(self, v, _ctx):
         self._vol = v
 
+    def RegisterControlChangeNotify(self, cb):
+        pass
+
+    def UnregisterControlChangeNotify(self, cb):
+        pass
+
 
 class _FakeDevice:
     def __init__(self, endpoint):
         self.EndpointVolume = endpoint
         self.id = "fake-endpoint-0"
+
+
+class _FakeEnumerator:
+    def RegisterEndpointNotificationCallback(self, cb):
+        pass
+
+    def UnregisterEndpointNotificationCallback(self, cb):
+        pass
 
 
 class MuteTestBase(unittest.TestCase):
@@ -47,13 +61,9 @@ class MuteTestBase(unittest.TestCase):
         self._orig_enum = localmute.AudioUtilities.GetDeviceEnumerator
         localmute._endpoint = lambda: self.ep
         localmute._speakers = lambda: _FakeDevice(self.ep)
-        localmute.AudioUtilities.GetDeviceEnumerator = self._no_enumerator
+        localmute.AudioUtilities.GetDeviceEnumerator = _FakeEnumerator
         self._marker = {}                       # in-memory marker
         localmute._marker_path = lambda: _FakePath(self._marker)
-
-    @staticmethod
-    def _no_enumerator():
-        raise AssertionError("tests must not register a real device callback")
 
     def tearDown(self):
         localmute._endpoint = self._orig_ep
