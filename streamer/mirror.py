@@ -52,6 +52,14 @@ DEFAULT_TARGET_DELAY_MS = 400    # openscreen kDefaultTargetPlayoutDelay
 OPUS_SAMPLES_PER_FRAME = FRAME_SAMPLES     # 480 = 10 ms at 48 kHz
 _NTP_EPOCH_OFFSET = 2208988800
 RTCP_INTERVAL = 0.5
+# Kickstart: when the receiver's checkpoint stops moving while we keep sending,
+# proactively re-send the frames just past it instead of waiting for a NACK
+# (on a lossy link the NACK itself is what gets lost). Same idea as the
+# Chromium/openscreen sender's kickstart. Frames are ~160 B, so a spurious
+# kick (feedback merely slow) costs nothing; the receiver drops duplicates.
+KICKSTART_AFTER = 0.3            # s the raw checkpoint must be frozen first
+KICKSTART_INTERVAL = 0.3         # s between kicks while it stays frozen
+KICKSTART_FRAMES = 4             # frames re-sent per kick, from checkpoint + 1
 
 # -- Cast Feedback (RTCP) parsing --------------------------------------------
 
@@ -302,6 +310,10 @@ class FeedbackStats:
     checkpoint_raw_since: float = 0.0
     playout_delay_ms: int = -1
     nack_events: int = 0
+    last_nack_at: float | None = None
+    retransmits: int = 0              # NACKed frames re-sent
+    retx_misses: int = 0              # NACKed frames no longer in history
+    kickstarts: int = 0               # proactive re-sends (see KICKSTART_AFTER)
     first_feedback_at: float | None = None
     last_feedback_at: float | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -311,6 +323,10 @@ class FeedbackStats:
             return {"rtcp_datagrams": self.datagrams, "cast_feedbacks": self.feedbacks,
                     "checkpoint": self.checkpoint, "playout_delay_ms": self.playout_delay_ms,
                     "nack_events": self.nack_events,
+                    "last_nack_at": self.last_nack_at,
+                    "retransmits": self.retransmits,
+                    "retx_misses": self.retx_misses,
+                    "kickstarts": self.kickstarts,
                     "first_feedback_at": self.first_feedback_at,
                     "last_feedback_at": self.last_feedback_at,
                     "checkpoint_raw_since": self.checkpoint_raw_since}
@@ -337,6 +353,8 @@ class CastRtpSender:
         self._frame0_packet = None
         self._history: dict = {}         # frame_id & 0xFF -> (packet_bytes, frame_id)
         self._last_retx: dict = {}       # frame_id & 0xFF -> monotonic
+        self._last_kick = 0.0
+        self._kick_episode: tuple | None = None   # (raw_since, kicks) while frozen
         self.stats = FeedbackStats()
 
     def _build_packet(self, encrypted: bytes, frame_id: int) -> bytes:
@@ -417,21 +435,85 @@ class CastRtpSender:
                 if not self._running:
                     return
                 time.sleep(0.05)
+                self.maybe_kickstart(time.monotonic())
+
+    def _resend(self, key: int, now: float) -> bool:
+        """Re-send the history entry for an 8-bit frame key, throttled per frame
+        by NACK_MIN_INTERVAL (shared by NACK retransmits and kickstarts)."""
+        entry = self._history.get(key)
+        if entry is None:
+            return False
+        if now - self._last_retx.get(key, 0.0) < self.NACK_MIN_INTERVAL:
+            return False
+        try:
+            self._sock.sendto(entry[0], self._dest)
+        except OSError:
+            return False
+        self._last_retx[key] = now
+        return True
 
     def _retransmit(self, nacks) -> None:
         now = time.monotonic()
+        sent = misses = 0
         for within_frame_id, _packet_id, _bitvec in nacks:
             key = within_frame_id & 0xFF
-            entry = self._history.get(key)
-            if entry is None:
-                continue
-            if now - self._last_retx.get(key, 0.0) < self.NACK_MIN_INTERVAL:
-                continue
-            try:
-                self._sock.sendto(entry[0], self._dest)
-            except OSError:
-                continue
-            self._last_retx[key] = now
+            if key not in self._history:
+                misses += 1
+            elif self._resend(key, now):
+                sent += 1
+        with self.stats.lock:
+            self.stats.retransmits += sent
+            self.stats.retx_misses += misses
+
+    def maybe_kickstart(self, now: float) -> int:
+        """If the raw checkpoint has been frozen past KICKSTART_AFTER while
+        frames beyond it were sent, re-send up to KICKSTART_FRAMES frames from
+        checkpoint + 1 (the frame the receiver is waiting on). Returns frames
+        re-sent. Also logs when a kicked stall clears on its own, so a bad-
+        network day shows whether kickstart is what saved the session."""
+        snap = self.stats.snapshot()
+        cp, raw_since = snap["checkpoint"], snap["checkpoint_raw_since"]
+        if cp < 0 or not raw_since:
+            return 0
+        ep = self._kick_episode
+        if ep is not None and ep[0] != raw_since:
+            # checkpoint moved: the stall cleared without a teardown
+            if ep[1] >= 2:
+                log.info("checkpoint stall cleared after %.1f s (%d kickstarts)",
+                         raw_since - ep[0], ep[1])
+            self._kick_episode = ep = None
+        last_sent = self.last_sent_frame_id
+        if (now - raw_since < KICKSTART_AFTER or cp >= last_sent
+                or now - self._last_kick < KICKSTART_INTERVAL):
+            return 0
+        sent = 0
+        for fid in range(cp + 1, min(cp + KICKSTART_FRAMES, last_sent) + 1):
+            entry = self._history.get(fid & 0xFF)
+            # the 8-bit slot must still hold THIS frame, not a later wrap
+            if entry is not None and entry[1] == fid and self._resend(fid & 0xFF, now):
+                sent += 1
+        self._last_kick = now
+        self._kick_episode = (raw_since, (ep[1] if ep else 0) + 1)
+        with self.stats.lock:
+            self.stats.kickstarts += 1
+        return sent
+
+    def stall_report(self, now: float) -> str:
+        """One-line diagnostic for a stall: is the receiver still NACKing, and
+        could we still serve the frame it is stuck on?"""
+        snap = self.stats.snapshot()
+        cp, last_sent = snap["checkpoint"], self.last_sent_frame_id
+        nxt = self._history.get((cp + 1) & 0xFF)
+        have_next = nxt is not None and nxt[1] == cp + 1
+
+        def age(t):
+            return "never" if t is None else f"{now - t:.1f}s"
+        return (f"checkpoint={cp} last_sent={last_sent} in_flight={last_sent - cp} "
+                f"frozen={now - snap['checkpoint_raw_since']:.1f}s "
+                f"feedback_age={age(snap['last_feedback_at'])} "
+                f"nack_events={snap['nack_events']} last_nack={age(snap['last_nack_at'])} "
+                f"retransmits={snap['retransmits']} retx_misses={snap['retx_misses']} "
+                f"kickstarts={snap['kickstarts']} next_frame_in_history={have_next}")
 
     def _recv_loop(self) -> None:
         while self._running:
@@ -461,6 +543,7 @@ class CastRtpSender:
                     self.stats.playout_delay_ms = fb.playout_delay_ms
                     if fb.nacks:
                         self.stats.nack_events += 1
+                        self.stats.last_nack_at = now
                         nacks.extend(fb.nacks)
             # retransmit does socket I/O; never under stats.lock (snapshot() is
             # polled every 100-500 ms by the session and must not block on send)
@@ -569,14 +652,103 @@ LAUNCH_TIMEOUT = 5.0
 ANSWER_TIMEOUT = 4.0
 MONITOR_PERIOD = 0.5
 RTCP_SILENCE_TIMEOUT = 6.0          # no feedback at all this long -> dead
-CHECKPOINT_STALL_TIMEOUT = 2.0      # raw checkpoint byte frozen while sending
+# Raw checkpoint byte frozen while sending. Kickstart clears most stalls well
+# inside this (seen live: 0.8-2.3 s), so leave it room before a full rebuild.
+CHECKPOINT_STALL_TIMEOUT = 3.0
 REOFFER_MAX_ATTEMPTS = 2            # mid-session recoveries before HTTP fallback
+# The first re-OFFER goes almost at once: on a lossy link the receiver is
+# usually reachable (ANSWERs land in ~50 ms), so waiting the full backoff only
+# adds dead air. Later attempts back off, in case the link really is down.
+FIRST_RETRY_DELAY = 0.25
 BACKOFF_START, BACKOFF_CAP = 2.0, 30.0
+
+# Group member watch: Cast's multi-room sync can drop follower speakers (seen
+# live after a leader network blip) while the leader keeps ACKing, so the
+# stream looks healthy and the room goes quiet. Relaunching the receiver app on
+# the group re-gathers the members - what a manual stop + start does.
+MEMBER_DROP_PREFIX = "group member dropped"
+MEMBER_REJOIN_MAX = 3               # relaunches for member drops per window...
+MEMBER_REJOIN_WINDOW = 600.0        # ...so a speaker unplugged mid-cast can't
+                                    # make the whole group rebuild forever
 
 # Reasons a re-OFFER cannot fix (the fault is local, not the receiver): skip
 # recovery and fall back immediately. A capture format change also invalidates
 # the HTTP server's WAV header, so appctl fixes it with a full pipeline restart.
 PERMANENT_REASONS = {"capture format changed"}
+
+
+class GroupMemberWatch:
+    """Tracks each member speaker's running app during a group cast and
+    reports one that has left the session.
+
+    Pure bookkeeping (observe/dropped take an explicit clock) so it unit-tests
+    without speakers; the connections that feed it live in MirrorSession.
+
+    A member counts as joined if it is running ANY app once the stream has
+    settled (ARM_DELAY after reset - long enough for the group launch to
+    replace whatever was playing before). A joined member whose app goes to
+    None for DROP_GRACE is reported. Switching to a different app is someone
+    casting something else to that speaker on purpose: it is released, never
+    reported, and so is a member that only starts an app after arming."""
+
+    ARM_DELAY = 5.0
+    DROP_GRACE = 1.5
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._apps: dict = {}            # name -> current app_id (or None)
+        self._gone_since: dict = {}      # name -> when app_id became None
+        self._joined: dict = {}          # name -> app_id it joined with
+        self._arm_at: float | None = None
+        self._armed = False
+
+    def reset(self, now: float) -> None:
+        """A new stream: forget who had joined, re-arm after ARM_DELAY."""
+        with self._lock:
+            self._joined = {}
+            self._armed = False
+            self._arm_at = now + self.ARM_DELAY
+
+    def disable(self) -> None:
+        with self._lock:
+            self._joined = {}
+            self._arm_at = None
+
+    def observe(self, name: str, app_id, now: float) -> None:
+        with self._lock:
+            self._apps[name] = app_id
+            if app_id is None:
+                self._gone_since.setdefault(name, now)
+                return
+            self._gone_since.pop(name, None)
+            joined = self._joined.get(name)
+            if joined is not None and joined != app_id:
+                log.info("group member %r switched to app %s; no longer watched",
+                         name, app_id)
+                del self._joined[name]
+
+    def dropped(self, now: float) -> str | None:
+        with self._lock:
+            if self._arm_at is None or now < self._arm_at:
+                return None
+            if not self._armed:
+                if not any(self._apps.values()):
+                    return None      # nothing has joined yet; keep waiting
+                self._joined = {n: a for n, a in self._apps.items() if a is not None}
+                self._armed = True               # snapshot once per stream
+            for name in self._joined:
+                since = self._gone_since.get(name)
+                if since is not None and now - since >= self.DROP_GRACE:
+                    return name
+            return None
+
+
+class _MemberStatusListener:
+    def __init__(self, watch: GroupMemberWatch, name: str) -> None:
+        self._watch, self._name = watch, name
+
+    def new_cast_status(self, status) -> None:
+        self._watch.observe(self._name, status.app_id, time.monotonic())
 
 
 class MirrorFirstFrameError(RuntimeError):
@@ -628,6 +800,9 @@ class MirrorSession:
         self._app_id = ""
         self._pd_logged: int | None = None   # last receiver playout delay logged
         self._pd_logged_at = 0.0
+        self._members = GroupMemberWatch()
+        self._member_casts: list = []         # SafeCasts feeding _members
+        self._rejoins: collections.deque = collections.deque()
         self.trim_count = 0        # mirror does not trim; kept for the contract
         self.recast_count = 0
 
@@ -690,6 +865,46 @@ class MirrorSession:
         self._watchdog = threading.Thread(target=self._run_watchdog,
                                           name="mirror-watchdog", daemon=True)
         self._watchdog.start()
+        if getattr(self._cast, "cast_type", None) == "group":
+            threading.Thread(target=self._watch_members, name="mirror-members",
+                             daemon=True).start()
+
+    def _watch_members(self) -> None:
+        """Connect to each member of the group and feed their app status into
+        the member watch. Best effort: a member we can't reach is just not
+        watched (the cast itself doesn't depend on these connections)."""
+        from . import safety
+        try:
+            uuids = safety.resolve_group_members(
+                self._cast.unwrap_for_safety_module_only())
+        except Exception as exc:
+            log.info("group member watch off (members unresolved: %s)", exc)
+            return
+        known = self._discovery.devices
+        names = [known[u] for u in (uuids or []) if u in known]
+        for name in names:
+            if self._stop.is_set():
+                break
+            try:
+                sc = self._discovery.connect(name, timeout=5)
+            except Exception as exc:
+                log.info("group member %r not watched: %s", name, exc)
+                continue
+            self._member_casts.append(sc)
+            sc.register_status_listener(_MemberStatusListener(self._members, name))
+            self._members.observe(name, sc.app_id, time.monotonic())
+        if self._stop.is_set():
+            self._close_member_casts()
+        else:
+            log.info("watching group members: %s", ", ".join(names) or "none")
+
+    def _close_member_casts(self) -> None:
+        casts, self._member_casts = self._member_casts, []
+        for sc in casts:
+            try:
+                sc.disconnect(timeout=2)
+            except Exception:
+                pass
 
     def _establish(self) -> None:
         """Launch (idempotent) + OFFER + fresh sender/sink. Raises on failure or
@@ -716,6 +931,7 @@ class MirrorSession:
         self._answer_at = time.monotonic()
         self._playing = False
         self._pd_logged = None      # fresh stream: log its playout delay anew
+        self._members.reset(self._answer_at)
         self._emit("BUFFERING", self._cast.name)
 
     def _teardown_stream(self) -> None:
@@ -792,7 +1008,36 @@ class MirrorSession:
         if (snap["checkpoint"] >= 0 and raw_since
                 and now - raw_since > CHECKPOINT_STALL_TIMEOUT):
             return "checkpoint stalled"
+        member = self._members.dropped(now)
+        if member is not None:
+            return f"{MEMBER_DROP_PREFIX}: {member}"
         return None
+
+    def _member_rejoin_allowed(self, now: float) -> bool:
+        """Budget member-drop relaunches; past it, stop watching for this cast
+        (keep playing on the rest of the group rather than rebuild forever)."""
+        while self._rejoins and now - self._rejoins[0] > MEMBER_REJOIN_WINDOW:
+            self._rejoins.popleft()
+        if len(self._rejoins) >= MEMBER_REJOIN_MAX:
+            log.warning("group members keep dropping (%d relaunches in %.0f s); "
+                        "member watch off for this cast", len(self._rejoins),
+                        MEMBER_REJOIN_WINDOW)
+            self._members.disable()
+            return False
+        self._rejoins.append(now)
+        return True
+
+    def _quit_receiver_app(self) -> None:
+        """Quit the mirroring app so the next launch starts a fresh group
+        session (a new OFFER alone keeps the session that lost its members)."""
+        try:
+            self._cast.quit_app()
+        except Exception as exc:
+            log.debug("quit_app: %s", exc)
+        deadline = time.monotonic() + 3.0
+        while (self._cast.app_id in (AUDIO_ONLY_APP_ID, AV_APP_ID)
+               and time.monotonic() < deadline and not self._stop.is_set()):
+            time.sleep(0.1)
 
     def _log_playout_delay(self) -> None:
         """Surface the receiver's SELF-REPORTED playout delay (from Cast
@@ -846,7 +1091,13 @@ class MirrorSession:
                 self._log_playout_delay()
                 self._emit("PLAYING", self._playing_detail())
                 continue
+            if (reason.startswith(MEMBER_DROP_PREFIX)
+                    and not self._member_rejoin_allowed(time.monotonic())):
+                continue
             log.warning("mirror unhealthy: %s", reason)
+            sender = self._sender
+            if sender is not None and reason in ("checkpoint stalled", "rtcp silence"):
+                log.info("stall detail: %s", sender.stall_report(time.monotonic()))
             if reason in PERMANENT_REASONS:
                 # re-OFFER cannot fix a local fault; hand straight to appctl
                 self._on_fallback_needed(reason)
@@ -864,7 +1115,9 @@ class MirrorSession:
                 return False
             self._emit("RECONNECTING", f"{reason} (attempt {attempt})")
             self._teardown_stream()
-            if self._stop.wait(backoff):
+            if reason.startswith(MEMBER_DROP_PREFIX):
+                self._quit_receiver_app()
+            if self._stop.wait(FIRST_RETRY_DELAY if attempt == 1 else backoff):
                 return False
             try:
                 self._establish()
@@ -888,6 +1141,7 @@ class MirrorSession:
         if self._watchdog is not None:
             self._watchdog.join(timeout=MONITOR_PERIOD + 1)
         self._teardown_stream()
+        self._close_member_casts()
         try:
             self._cast.quit_app()
         except Exception as exc:
