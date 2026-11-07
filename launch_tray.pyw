@@ -13,6 +13,13 @@ if not getattr(sys, "frozen", False):
     os.chdir(REPO)
     sys.path.insert(0, str(REPO))
 
+# A self-update hands over to the downloaded exe in installer mode; that
+# process only swaps the files and relaunches - no tray, no guard port.
+from streamer import updater  # noqa: E402
+
+if updater.maybe_run_installer(sys.argv):
+    sys.exit(0)
+
 from streamer.tray import main  # noqa: E402
 
 sys.exit(main())

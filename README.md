@@ -26,6 +26,16 @@ connections from your local subnet. If you decline the approval, allow the
 app for **both** private and public networks when Windows asks on the first
 cast; otherwise casting stops with a firewall error explaining the fix.
 
+## Updates
+
+The app checks GitHub for a newer release a minute after it starts and then
+once a day. When there is one, the tray icon says so and its right-click menu
+gains **Update to vX.Y.Z**. Choosing it (while nothing is casting) downloads
+the new exe next to the current one, checks it against the size and SHA-256
+GitHub publishes, swaps it in and restarts the app - same location, so
+Start with Windows and the firewall rule keep working. If anything goes wrong
+the current version keeps running. Runs from source never self-update.
+
 ## Use
 
 Left-click the tray icon for a popover listing your speaker **Groups** and

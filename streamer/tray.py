@@ -1,7 +1,8 @@
 """Tray icon (pystray) + entry point wiring icon, popover and controller.
 
 The icon is a view: left-click toggles the popover (never casts), right-click
-offers Open / Exit, and the glyph colour tracks controller state:
+offers Open / Exit (plus "Update to vX" once a newer release is out - see
+updater.py), and the glyph colour tracks controller state:
 grey idle, amber transitional, blue casting, red error.
 
 Single instance: a localhost guard port doubles as a control channel - a
@@ -18,7 +19,7 @@ import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 from . import config as cfg_mod
-from . import firewall, startup
+from . import firewall, startup, updater
 from .appctl import AppController, TRANSITIONAL_STATES
 from .ui.fonts import ASSETS, ICONS
 from .ui.popover import Popover
@@ -69,11 +70,18 @@ class TrayApp:
     def __init__(self):
         self.ctl = AppController()
         self.popover = Popover(self.ctl, on_exit=self._exit)
+        self.checker = updater.UpdateChecker(on_found=self._on_update_found)
+        self._updating = False
         self.icon = pystray.Icon(
             "desktop-audio-streamer", _glyph(COLORS["idle"]),
             "Desktop Audio Streamer",
             menu=pystray.Menu(
                 pystray.MenuItem("Open", self._show, default=True),
+                pystray.MenuItem(
+                    lambda item: f"Update to v{self.checker.available.version}",
+                    lambda icon, item: self._start_update(),
+                    visible=lambda item: self.checker.available is not None,
+                    enabled=lambda item: not self._updating),
                 pystray.MenuItem("Exit", lambda icon, item: self._exit()),
             ))
         self.ctl.add_listener(self._on_event)
@@ -131,9 +139,57 @@ class TrayApp:
         # pystray thread -> marshal into the Tk thread
         self.popover.post(self.popover.toggle)
 
+    # -- self-update ----------------------------------------------------------
+
+    def _notify(self, text: str) -> None:
+        try:
+            self.icon.notify(text, "Desktop Audio Streamer")
+        except Exception:
+            pass
+
+    def _on_update_found(self, update) -> None:
+        self.icon.update_menu()
+        self._notify(f"Version {update.version} is available. Right-click the "
+                     "tray icon and choose Update.")
+
+    def _casting(self) -> bool:
+        return self.ctl.session is not None or self.ctl.busy()
+
+    def _start_update(self) -> None:
+        """Download, verify, hand over to the installer step, exit. Only while
+        idle: replacing the app mid-cast would cut the room off."""
+        update, exe = self.checker.available, updater.frozen_exe()
+        if update is None or exe is None or self._updating:
+            return
+        if self._casting():
+            self._notify("Stop casting first, then choose Update.")
+            return
+        self._updating = True
+        self.icon.update_menu()
+
+        def run():
+            dest = exe.with_name(updater.UPDATE_NAME)
+            try:
+                log.info("downloading update %s", update.version)
+                updater.download(update, dest)
+                if self._casting():
+                    raise RuntimeError("casting started during the download")
+                updater.hand_over(dest, exe)
+            except Exception as exc:
+                log.error("update failed: %s", exc)
+                dest.unlink(missing_ok=True)
+                self._updating = False
+                self.icon.update_menu()
+                self._notify(f"Update failed: {exc}")
+                return
+            log.info("handing over to update %s", update.version)
+            self._exit()
+        threading.Thread(target=run, name="update-apply", daemon=True).start()
+
     def _exit(self) -> None:
         log.info("exit requested")
         self.icon.visible = False
+        self.checker.stop()
         self.ctl.shutdown(then=lambda: (self.icon.stop(), self.popover.quit()))
 
     # -- lifecycle --------------------------------------------------------------
@@ -143,6 +199,10 @@ class TrayApp:
             log.info("another instance is running - asked it to show; exiting")
             return 0
         startup.repair_if_stale()
+        exe = updater.frozen_exe()
+        if exe is not None:                 # self-update is for the exe only
+            updater.cleanup(exe.parent)
+            self.checker.start()
         threading.Thread(
             target=lambda: firewall.ensure_allowed(self.ctl.cfg, cfg_mod.save),
             name="fw-register", daemon=True).start()
